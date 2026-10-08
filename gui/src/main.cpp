@@ -1,19 +1,13 @@
 /* -------------------------------------------------------------------------
- * Split 8 fronthaul scope - ImGui / ImPlot front end
+ * Split 8 fronthaul scope
  *
- * Oscilloscope-style view: one time axis across a 10 ms frame, with the
- * downlink and uplink traces overlaid so the two directions can be compared
- * slot by slot. Resolution is one point per eCPRI packet (15.625 us), so
- * the turnaround inside a mixed slot is visible.
+ * Oscilloscope layout: one shared time axis, each direction in its own
+ * horizontal lane (like C1/C2 on a bench scope). Resolution is one point
+ * per eCPRI packet (15.625 us). Span is adjustable from one 10 ms frame
+ * up to 32 frames (320 ms).
  *
- * Capture runs on its own thread. The render thread only reads.
- *
- * Run:   ./build/src/imgui_app <iface> <dl-src-mac>
- * e.g.   ./build/src/imgui_app sfp1 bc:24:11:ec:73:d3
- *
- * Give the binary capture rights once, instead of using sudo (which loses
- * the X authority cookie):
- *   sudo setcap "cap_net_raw,cap_net_admin=eip" ./build/src/imgui_app
+ * Run:  ./build/src/imgui_app <iface> <dl-src-mac>
+ *       sudo setcap "cap_net_raw,cap_net_admin=eip" ./build/src/imgui_app
  * ---------------------------------------------------------------------- */
 
 #include <iostream>
@@ -42,13 +36,14 @@
 #define SLOTS_PER_FRAME   20
 #define PKTS_PER_FRAME    640
 #define FULL_SCALE        32767.0
-#define SILENT_DB         (-120.0f)
+#define SILENT_DB         (-125.0f)
 
-/* one point per packet = 15.625 us = 0.015625 ms */
-#define US_PER_PKT        0.015625
+#define MS_PER_PKT        0.015625        /* 15.625 us */
+#define FRAMES_HIST       32              /* ring depth = 320 ms */
+#define NPTS              (PKTS_PER_FRAME * FRAMES_HIST)
 
-static float g_cur_dl[PKTS_PER_FRAME], g_cur_ul[PKTS_PER_FRAME];
-static float g_max_dl[PKTS_PER_FRAME], g_max_ul[PKTS_PER_FRAME];
+static float g_hist_dl[NPTS], g_hist_ul[NPTS];
+static std::atomic<int> g_fr_dl(0), g_fr_ul(0);   /* next frame slot */
 
 static std::atomic<uint64_t> g_pkts_dl(0), g_pkts_ul(0);
 static std::atomic<uint64_t> g_frames_dl(0), g_frames_ul(0);
@@ -56,13 +51,12 @@ static std::atomic<uint32_t> g_cells_dl(0), g_cells_ul(0);
 static std::atomic<uint32_t> g_drop(0), g_ifdrop(0);
 static std::atomic<uint64_t> g_bad(0), g_trunc(0);
 static std::atomic<bool>     g_running(true);
-static std::atomic<bool>     g_reset_peak(false);
 
 static pcap_t      *g_ph = NULL;
 static unsigned char g_dl_mac[6];
 
-static bool g_show_peak = true;
-static bool g_show_live = true;
+static int  g_span   = 8;        /* frames shown */
+static bool g_frozen = false;
 
 typedef struct {
     uint64_t acc[PKTS_PER_FRAME];
@@ -76,10 +70,11 @@ static dir_t g_dl, g_ul;
 
 static void finish_frame(dir_t *d)
 {
-    float *cur = d->is_dl ? g_cur_dl : g_cur_ul;
-    float *mx  = d->is_dl ? g_max_dl : g_max_ul;
+    float *hist = d->is_dl ? g_hist_dl : g_hist_ul;
+    std::atomic<int> &fr = d->is_dl ? g_fr_dl : g_fr_ul;
 
-    bool clear = g_reset_peak.exchange(false);
+    int f = fr.load();
+    float *row = hist + (size_t)f * PKTS_PER_FRAME;
 
     uint32_t have = 0;
     for (uint32_t c = 0; c < PKTS_PER_FRAME; c++) {
@@ -89,20 +84,19 @@ static void finish_frame(dir_t *d)
         if (d->acc[c] > 0) {
             double mean = (double)d->acc[c] / (double)(SAMPLES_PER_PKT * 2);
             db = (float)(10.0 * log10(mean / (FULL_SCALE * FULL_SCALE)));
+            if (db < SILENT_DB) db = SILENT_DB;
         }
-        cur[c] = db;
-        if (clear || db > mx[c]) mx[c] = db;
-
+        row[c] = db;
         d->acc[c] = 0;
     }
 
+    fr.store((f + 1) % FRAMES_HIST);
     memset(d->seen, 0, sizeof d->seen);
 
     if (d->is_dl) { g_frames_dl++; g_cells_dl.store(have); }
     else          { g_frames_ul++; g_cells_ul.store(have); }
 }
 
-/* hot path: touches each sample once, integer arithmetic, no frame buffer */
 static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
                       const unsigned char *bytes)
 {
@@ -110,7 +104,7 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
 
     if (h->caplen < 14 + ECPRI_HDR_SIZE + SAMPLES_PER_PKT * 4) { g_trunc++; return; }
 
-    const unsigned char *b = bytes + 14;          /* skip Ethernet header */
+    const unsigned char *b = bytes + 14;
     if (((b[0] >> 4) & 0x0F) != 1 || b[1] != 0x00) { g_bad++; return; }
 
     uint16_t v;
@@ -125,7 +119,6 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
 
     if (is_dl) g_pkts_dl++; else g_pkts_ul++;
 
-    /* a cell number that went backwards means a new frame started */
     if (d->started && cell < d->last_cell) finish_frame(d);
     d->started   = 1;
     d->last_cell = cell;
@@ -163,7 +156,6 @@ static void capture_thread(const char *iface)
     g_ph = pcap_create(iface, err);
     if (!g_ph) { std::cerr << "pcap_create: " << err << "\n"; return; }
 
-    /* buffer size must be set BEFORE activation */
     pcap_set_snaplen(g_ph, 9000);
     pcap_set_promisc(g_ph, 1);
     pcap_set_timeout(g_ph, 10);
@@ -182,6 +174,15 @@ static void capture_thread(const char *iface)
     }
 
     pcap_loop(g_ph, -1, on_packet, NULL);
+}
+
+/* map dBFS into a lane of height 1.0 starting at base */
+static inline double lane(double db, double base)
+{
+    double v = (db - SILENT_DB) / (0.0 - SILENT_DB);
+    if (v < 0) v = 0;
+    if (v > 1) v = 1;
+    return base + v;
 }
 
 static void glfwErrorCallback(int e, const char *d)
@@ -208,21 +209,13 @@ int main(int argc, char **argv)
     memset(&g_ul, 0, sizeof g_ul);
     g_dl.is_dl = 1;
 
-    for (int c = 0; c < PKTS_PER_FRAME; c++)
-        g_cur_dl[c] = g_cur_ul[c] = g_max_dl[c] = g_max_ul[c] = SILENT_DB;
-
-    /* x axis: time inside the frame, in milliseconds */
-    static double xs[PKTS_PER_FRAME];
-    for (int c = 0; c < PKTS_PER_FRAME; c++) xs[c] = c * US_PER_PKT;
-
-    static double slot_x[SLOTS_PER_FRAME];
-    for (int s = 0; s < SLOTS_PER_FRAME; s++) slot_x[s] = s * 0.5;
+    for (int i = 0; i < NPTS; i++) g_hist_dl[i] = g_hist_ul[i] = SILENT_DB;
 
     glfwSetErrorCallback(glfwErrorCallback);
     if (!glfwInit()) { std::cerr << "glfwInit failed\n"; return 1; }
 
     glfwDefaultWindowHints();
-    GLFWwindow *window = glfwCreateWindow(1300, 700,
+    GLFWwindow *window = glfwCreateWindow(1400, 760,
                                           "Split 8 fronthaul scope",
                                           nullptr, nullptr);
     if (!window) { std::cerr << "no window - is DISPLAY set?\n"; glfwTerminate(); return 1; }
@@ -244,8 +237,11 @@ int main(int argc, char **argv)
     std::thread cap(capture_thread, argv[1]);
     std::thread sta(stats_thread);
 
-    static double yd[PKTS_PER_FRAME], yu[PKTS_PER_FRAME];
-    static double pd[PKTS_PER_FRAME], pu[PKTS_PER_FRAME];
+    static double xs[NPTS], yd[NPTS], yu[NPTS];
+    static double fx[FRAMES_HIST + 1];
+
+    static const double tick_pos[2]  = { 0.5, 1.6 };
+    static const char  *tick_lbl[2]  = { "UL   UE -> gNB", "DL   gNB -> UE" };
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -277,38 +273,46 @@ int main(int argc, char **argv)
             ImGui::TextColored(ImVec4(0.3f, 1, 0.3f, 1),
                                "drop=+0 ifdrop=+0  clean    %.0f FPS", io.Framerate);
 
-        ImGui::Checkbox("live trace", &g_show_live);
+        ImGui::SetNextItemWidth(300);
+        ImGui::SliderInt("span (frames of 10 ms)", &g_span, 1, FRAMES_HIST);
         ImGui::SameLine();
-        ImGui::Checkbox("peak hold", &g_show_peak);
-        ImGui::SameLine();
-        if (ImGui::Button("reset peak")) g_reset_peak.store(true);
+        ImGui::Checkbox("freeze", &g_frozen);
 
-        for (int c = 0; c < PKTS_PER_FRAME; c++) {
-            yd[c] = g_cur_dl[c];  yu[c] = g_cur_ul[c];
-            pd[c] = g_max_dl[c];  pu[c] = g_max_ul[c];
+        int n = g_span * PKTS_PER_FRAME;
+
+        if (!g_frozen) {
+            int fd = g_fr_dl.load();
+            int fu = g_fr_ul.load();
+            int sd = (fd - g_span + FRAMES_HIST) % FRAMES_HIST;
+            int su = (fu - g_span + FRAMES_HIST) % FRAMES_HIST;
+
+            for (int i = 0; i < n; i++) {
+                int f  = i / PKTS_PER_FRAME;
+                int c  = i % PKTS_PER_FRAME;
+                xs[i] = i * MS_PER_PKT;
+                yd[i] = lane(g_hist_dl[((sd + f) % FRAMES_HIST) * PKTS_PER_FRAME + c], 1.1);
+                yu[i] = lane(g_hist_ul[((su + f) % FRAMES_HIST) * PKTS_PER_FRAME + c], 0.0);
+            }
         }
 
-        if (ImPlot::BeginPlot("##scope", ImVec2(-1, -1))) {
-            ImPlot::SetupAxes("time inside frame  (ms)", "power  (dBFS)");
-            ImPlot::SetupAxisLimits(ImAxis_X1, 0, 10, ImPlotCond_Always);
-            ImPlot::SetupAxisLimits(ImAxis_Y1, -125, 0, ImPlotCond_Always);
+        for (int f = 0; f <= g_span; f++) fx[f] = f * 10.0;
 
-            /* slot boundaries every 0.5 ms */
-            ImPlot::SetNextLineStyle(ImVec4(0.4f, 0.4f, 0.4f, 0.5f), 1.0f);
-            ImPlot::PlotInfLines("##slot", slot_x, SLOTS_PER_FRAME);
+        if (ImPlot::BeginPlot("##scope", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
+            ImPlot::SetupAxes("time  (ms)", NULL);
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0, g_span * 10.0, ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, -0.05, 2.25, ImPlotCond_Always);
+            ImPlot::SetupAxisTicks(ImAxis_Y1, tick_pos, 2, tick_lbl);
 
-            if (g_show_peak) {
-                ImPlot::SetNextLineStyle(ImVec4(0.2f, 0.5f, 1.0f, 0.45f), 1.0f);
-                ImPlot::PlotLine("DL peak", xs, pd, PKTS_PER_FRAME);
-                ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.5f, 0.1f, 0.45f), 1.0f);
-                ImPlot::PlotLine("UL peak", xs, pu, PKTS_PER_FRAME);
-            }
-            if (g_show_live) {
-                ImPlot::SetNextLineStyle(ImVec4(0.3f, 0.7f, 1.0f, 1.0f), 2.0f);
-                ImPlot::PlotLine("DL  gNB -> UE", xs, yd, PKTS_PER_FRAME);
-                ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), 2.0f);
-                ImPlot::PlotLine("UL  UE -> gNB", xs, yu, PKTS_PER_FRAME);
-            }
+            /* frame boundaries every 10 ms */
+            ImPlot::SetNextLineStyle(ImVec4(0.45f, 0.45f, 0.45f, 0.6f), 1.0f);
+            ImPlot::PlotInfLines("##frame", fx, g_span + 1);
+
+            ImPlot::SetNextLineStyle(ImVec4(1.00f, 0.90f, 0.20f, 1.0f), 1.3f);
+            ImPlot::PlotLine("DL", xs, yd, n);
+
+            ImPlot::SetNextLineStyle(ImVec4(0.30f, 1.00f, 0.40f, 1.0f), 1.3f);
+            ImPlot::PlotLine("UL", xs, yu, n);
+
             ImPlot::EndPlot();
         }
 
@@ -318,7 +322,7 @@ int main(int argc, char **argv)
         int w, h;
         glfwGetFramebufferSize(window, &w, &h);
         glViewport(0, 0, w, h);
-        glClearColor(0.08f, 0.09f, 0.11f, 1.00f);
+        glClearColor(0.05f, 0.05f, 0.07f, 1.00f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
