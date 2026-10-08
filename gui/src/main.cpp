@@ -1,13 +1,15 @@
 /* -------------------------------------------------------------------------
  * Split 8 fronthaul scope
  *
- * Oscilloscope layout: one shared time axis, each direction in its own
- * horizontal lane (like C1/C2 on a bench scope). Resolution is one point
- * per eCPRI packet (15.625 us). Span is adjustable from one 10 ms frame
- * up to 32 frames (320 ms).
+ * X axis is the slot number, 0 to 19, fixed. Y axis is power in dBFS.
+ * Both directions are drawn on the same axes: flat at the noise floor,
+ * stepping up in the slots that carry energy. This is the terminal table
+ * drawn as a trace.
  *
  * Run:  ./build/src/imgui_app <iface> <dl-src-mac>
  *       sudo setcap "cap_net_raw,cap_net_admin=eip" ./build/src/imgui_app
+ *       (setcap must be repeated after every rebuild; do NOT use sudo to
+ *        run, it discards the X authority cookie)
  * ---------------------------------------------------------------------- */
 
 #include <iostream>
@@ -35,15 +37,12 @@
 #define PKTS_PER_SLOT     32
 #define SLOTS_PER_FRAME   20
 #define PKTS_PER_FRAME    640
+#define SAMPLES_PER_SLOT  61440
 #define FULL_SCALE        32767.0
-#define SILENT_DB         (-125.0f)
+#define FLOOR_DB          (-125.0f)
 
-#define MS_PER_PKT        0.015625        /* 15.625 us */
-#define FRAMES_HIST       32              /* ring depth = 320 ms */
-#define NPTS              (PKTS_PER_FRAME * FRAMES_HIST)
-
-static float g_hist_dl[NPTS], g_hist_ul[NPTS];
-static std::atomic<int> g_fr_dl(0), g_fr_ul(0);   /* next frame slot */
+static float g_cur_dl[SLOTS_PER_FRAME], g_cur_ul[SLOTS_PER_FRAME];
+static float g_pk_dl[SLOTS_PER_FRAME],  g_pk_ul[SLOTS_PER_FRAME];
 
 static std::atomic<uint64_t> g_pkts_dl(0), g_pkts_ul(0);
 static std::atomic<uint64_t> g_frames_dl(0), g_frames_ul(0);
@@ -51,15 +50,15 @@ static std::atomic<uint32_t> g_cells_dl(0), g_cells_ul(0);
 static std::atomic<uint32_t> g_drop(0), g_ifdrop(0);
 static std::atomic<uint64_t> g_bad(0), g_trunc(0);
 static std::atomic<bool>     g_running(true);
+static std::atomic<bool>     g_reset_pk(false);
 
 static pcap_t      *g_ph = NULL;
 static unsigned char g_dl_mac[6];
 
-static int  g_span   = 8;        /* frames shown */
-static bool g_frozen = false;
+static bool g_show_pk = true;
 
 typedef struct {
-    uint64_t acc[PKTS_PER_FRAME];
+    uint64_t acc[SLOTS_PER_FRAME];
     uint8_t  seen[PKTS_PER_FRAME];
     uint32_t last_cell;
     int      started;
@@ -70,33 +69,33 @@ static dir_t g_dl, g_ul;
 
 static void finish_frame(dir_t *d)
 {
-    float *hist = d->is_dl ? g_hist_dl : g_hist_ul;
-    std::atomic<int> &fr = d->is_dl ? g_fr_dl : g_fr_ul;
+    float *cur = d->is_dl ? g_cur_dl : g_cur_ul;
+    float *pk  = d->is_dl ? g_pk_dl  : g_pk_ul;
 
-    int f = fr.load();
-    float *row = hist + (size_t)f * PKTS_PER_FRAME;
+    bool clear = g_reset_pk.exchange(false);
 
     uint32_t have = 0;
-    for (uint32_t c = 0; c < PKTS_PER_FRAME; c++) {
-        have += d->seen[c];
+    for (uint32_t c = 0; c < PKTS_PER_FRAME; c++) have += d->seen[c];
 
-        float db = SILENT_DB;
-        if (d->acc[c] > 0) {
-            double mean = (double)d->acc[c] / (double)(SAMPLES_PER_PKT * 2);
+    for (uint32_t s = 0; s < SLOTS_PER_FRAME; s++) {
+        float db = FLOOR_DB;
+        if (d->acc[s] > 0) {
+            double mean = (double)d->acc[s] / (double)SAMPLES_PER_SLOT;
             db = (float)(10.0 * log10(mean / (FULL_SCALE * FULL_SCALE)));
-            if (db < SILENT_DB) db = SILENT_DB;
+            if (db < FLOOR_DB) db = FLOOR_DB;
         }
-        row[c] = db;
-        d->acc[c] = 0;
+        cur[s] = db;
+        if (clear || db > pk[s]) pk[s] = db;
+        d->acc[s] = 0;
     }
 
-    fr.store((f + 1) % FRAMES_HIST);
     memset(d->seen, 0, sizeof d->seen);
 
     if (d->is_dl) { g_frames_dl++; g_cells_dl.store(have); }
     else          { g_frames_ul++; g_cells_ul.store(have); }
 }
 
+/* hot path: each sample touched once, integer arithmetic */
 static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
                       const unsigned char *bytes)
 {
@@ -130,7 +129,7 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
         acc += (uint64_t)(s * s);
     }
 
-    d->acc[cell] += acc;
+    d->acc[cell / PKTS_PER_SLOT] += acc;
     d->seen[cell] = 1;
 }
 
@@ -176,15 +175,6 @@ static void capture_thread(const char *iface)
     pcap_loop(g_ph, -1, on_packet, NULL);
 }
 
-/* map dBFS into a lane of height 1.0 starting at base */
-static inline double lane(double db, double base)
-{
-    double v = (db - SILENT_DB) / (0.0 - SILENT_DB);
-    if (v < 0) v = 0;
-    if (v > 1) v = 1;
-    return base + v;
-}
-
 static void glfwErrorCallback(int e, const char *d)
 {
     std::cerr << "GLFW error " << e << ": " << d << '\n';
@@ -209,13 +199,21 @@ int main(int argc, char **argv)
     memset(&g_ul, 0, sizeof g_ul);
     g_dl.is_dl = 1;
 
-    for (int i = 0; i < NPTS; i++) g_hist_dl[i] = g_hist_ul[i] = SILENT_DB;
+    for (int s = 0; s < SLOTS_PER_FRAME; s++)
+        g_cur_dl[s] = g_cur_ul[s] = g_pk_dl[s] = g_pk_ul[s] = FLOOR_DB;
+
+    /* stairs need one extra point so the last slot is closed off */
+    static double xs[SLOTS_PER_FRAME + 1];
+    for (int s = 0; s <= SLOTS_PER_FRAME; s++) xs[s] = s;
+
+    static double grid[SLOTS_PER_FRAME + 1];
+    for (int s = 0; s <= SLOTS_PER_FRAME; s++) grid[s] = s;
 
     glfwSetErrorCallback(glfwErrorCallback);
     if (!glfwInit()) { std::cerr << "glfwInit failed\n"; return 1; }
 
     glfwDefaultWindowHints();
-    GLFWwindow *window = glfwCreateWindow(1400, 760,
+    GLFWwindow *window = glfwCreateWindow(1300, 700,
                                           "Split 8 fronthaul scope",
                                           nullptr, nullptr);
     if (!window) { std::cerr << "no window - is DISPLAY set?\n"; glfwTerminate(); return 1; }
@@ -237,11 +235,8 @@ int main(int argc, char **argv)
     std::thread cap(capture_thread, argv[1]);
     std::thread sta(stats_thread);
 
-    static double xs[NPTS], yd[NPTS], yu[NPTS];
-    static double fx[FRAMES_HIST + 1];
-
-    static const double tick_pos[2]  = { 0.5, 1.6 };
-    static const char  *tick_lbl[2]  = { "UL   UE -> gNB", "DL   gNB -> UE" };
+    static double yd[SLOTS_PER_FRAME + 1], yu[SLOTS_PER_FRAME + 1];
+    static double qd[SLOTS_PER_FRAME + 1], qu[SLOTS_PER_FRAME + 1];
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -273,45 +268,41 @@ int main(int argc, char **argv)
             ImGui::TextColored(ImVec4(0.3f, 1, 0.3f, 1),
                                "drop=+0 ifdrop=+0  clean    %.0f FPS", io.Framerate);
 
-        ImGui::SetNextItemWidth(300);
-        ImGui::SliderInt("span (frames of 10 ms)", &g_span, 1, FRAMES_HIST);
+        ImGui::Checkbox("peak hold", &g_show_pk);
         ImGui::SameLine();
-        ImGui::Checkbox("freeze", &g_frozen);
+        if (ImGui::Button("reset peak")) g_reset_pk.store(true);
 
-        int n = g_span * PKTS_PER_FRAME;
-
-        if (!g_frozen) {
-            int fd = g_fr_dl.load();
-            int fu = g_fr_ul.load();
-            int sd = (fd - g_span + FRAMES_HIST) % FRAMES_HIST;
-            int su = (fu - g_span + FRAMES_HIST) % FRAMES_HIST;
-
-            for (int i = 0; i < n; i++) {
-                int f  = i / PKTS_PER_FRAME;
-                int c  = i % PKTS_PER_FRAME;
-                xs[i] = i * MS_PER_PKT;
-                yd[i] = lane(g_hist_dl[((sd + f) % FRAMES_HIST) * PKTS_PER_FRAME + c], 1.1);
-                yu[i] = lane(g_hist_ul[((su + f) % FRAMES_HIST) * PKTS_PER_FRAME + c], 0.0);
-            }
+        for (int s = 0; s < SLOTS_PER_FRAME; s++) {
+            yd[s] = g_cur_dl[s];  yu[s] = g_cur_ul[s];
+            qd[s] = g_pk_dl[s];   qu[s] = g_pk_ul[s];
         }
+        yd[SLOTS_PER_FRAME] = yd[SLOTS_PER_FRAME - 1];
+        yu[SLOTS_PER_FRAME] = yu[SLOTS_PER_FRAME - 1];
+        qd[SLOTS_PER_FRAME] = qd[SLOTS_PER_FRAME - 1];
+        qu[SLOTS_PER_FRAME] = qu[SLOTS_PER_FRAME - 1];
 
-        for (int f = 0; f <= g_span; f++) fx[f] = f * 10.0;
+        if (ImPlot::BeginPlot("##scope", ImVec2(-1, -1))) {
+            ImPlot::SetupAxes("slot", "power  (dBFS)");
+            ImPlot::SetupAxisLimits(ImAxis_X1, 0, SLOTS_PER_FRAME, ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, -130, 0, ImPlotCond_Always);
+            ImPlot::SetupAxisFormat(ImAxis_X1, "%g");
 
-        if (ImPlot::BeginPlot("##scope", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
-            ImPlot::SetupAxes("time  (ms)", NULL);
-            ImPlot::SetupAxisLimits(ImAxis_X1, 0, g_span * 10.0, ImPlotCond_Always);
-            ImPlot::SetupAxisLimits(ImAxis_Y1, -0.05, 2.25, ImPlotCond_Always);
-            ImPlot::SetupAxisTicks(ImAxis_Y1, tick_pos, 2, tick_lbl);
+            /* slot boundaries */
+            ImPlot::SetNextLineStyle(ImVec4(0.40f, 0.40f, 0.40f, 0.45f), 1.0f);
+            ImPlot::PlotInfLines("##grid", grid, SLOTS_PER_FRAME + 1);
 
-            /* frame boundaries every 10 ms */
-            ImPlot::SetNextLineStyle(ImVec4(0.45f, 0.45f, 0.45f, 0.6f), 1.0f);
-            ImPlot::PlotInfLines("##frame", fx, g_span + 1);
+            if (g_show_pk) {
+                ImPlot::SetNextLineStyle(ImVec4(1.00f, 0.90f, 0.20f, 0.40f), 1.0f);
+                ImPlot::PlotStairs("DL peak", xs, qd, SLOTS_PER_FRAME + 1);
+                ImPlot::SetNextLineStyle(ImVec4(0.30f, 1.00f, 0.40f, 0.40f), 1.0f);
+                ImPlot::PlotStairs("UL peak", xs, qu, SLOTS_PER_FRAME + 1);
+            }
 
-            ImPlot::SetNextLineStyle(ImVec4(1.00f, 0.90f, 0.20f, 1.0f), 1.3f);
-            ImPlot::PlotLine("DL", xs, yd, n);
+            ImPlot::SetNextLineStyle(ImVec4(1.00f, 0.90f, 0.20f, 1.0f), 2.5f);
+            ImPlot::PlotStairs("DL  gNB -> UE", xs, yd, SLOTS_PER_FRAME + 1);
 
-            ImPlot::SetNextLineStyle(ImVec4(0.30f, 1.00f, 0.40f, 1.0f), 1.3f);
-            ImPlot::PlotLine("UL", xs, yu, n);
+            ImPlot::SetNextLineStyle(ImVec4(0.30f, 1.00f, 0.40f, 1.0f), 2.5f);
+            ImPlot::PlotStairs("UL  UE -> gNB", xs, yu, SLOTS_PER_FRAME + 1);
 
             ImPlot::EndPlot();
         }
