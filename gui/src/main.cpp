@@ -1,15 +1,13 @@
 /* -------------------------------------------------------------------------
  * Split 8 fronthaul scope
  *
- * X axis is the slot number, 0 to 19, fixed. Y axis is power in dBFS.
- * Both directions are drawn on the same axes: flat at the noise floor,
- * stepping up in the slots that carry energy. This is the terminal table
- * drawn as a trace.
+ * One bar per slot per direction, with the dBFS value printed on the bar.
+ * X axis is the slot number 0..19. Taller bar = more power. Silent slots
+ * have no bar at all.
  *
  * Run:  ./build/src/imgui_app <iface> <dl-src-mac>
  *       sudo setcap "cap_net_raw,cap_net_admin=eip" ./build/src/imgui_app
- *       (setcap must be repeated after every rebuild; do NOT use sudo to
- *        run, it discards the X authority cookie)
+ *       (repeat setcap after every rebuild; do NOT run with sudo)
  * ---------------------------------------------------------------------- */
 
 #include <iostream>
@@ -39,7 +37,8 @@
 #define PKTS_PER_FRAME    640
 #define SAMPLES_PER_SLOT  61440
 #define FULL_SCALE        32767.0
-#define FLOOR_DB          (-125.0f)
+
+#define FLOOR_DB          (-110.0)      /* bottom of the bar chart */
 
 static float g_cur_dl[SLOTS_PER_FRAME], g_cur_ul[SLOTS_PER_FRAME];
 static float g_pk_dl[SLOTS_PER_FRAME],  g_pk_ul[SLOTS_PER_FRAME];
@@ -78,11 +77,11 @@ static void finish_frame(dir_t *d)
     for (uint32_t c = 0; c < PKTS_PER_FRAME; c++) have += d->seen[c];
 
     for (uint32_t s = 0; s < SLOTS_PER_FRAME; s++) {
-        float db = FLOOR_DB;
+        float db = (float)FLOOR_DB;
         if (d->acc[s] > 0) {
             double mean = (double)d->acc[s] / (double)SAMPLES_PER_SLOT;
             db = (float)(10.0 * log10(mean / (FULL_SCALE * FULL_SCALE)));
-            if (db < FLOOR_DB) db = FLOOR_DB;
+            if (db < FLOOR_DB) db = (float)FLOOR_DB;
         }
         cur[s] = db;
         if (clear || db > pk[s]) pk[s] = db;
@@ -95,7 +94,6 @@ static void finish_frame(dir_t *d)
     else          { g_frames_ul++; g_cells_ul.store(have); }
 }
 
-/* hot path: each sample touched once, integer arithmetic */
 static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
                       const unsigned char *bytes)
 {
@@ -175,6 +173,12 @@ static void capture_thread(const char *iface)
     pcap_loop(g_ph, -1, on_packet, NULL);
 }
 
+/* y axis holds "height above the floor"; print it back as real dBFS */
+static int fmt_dbfs(double v, char *buf, int size, void *)
+{
+    return snprintf(buf, size, "%.0f", v + FLOOR_DB);
+}
+
 static void glfwErrorCallback(int e, const char *d)
 {
     std::cerr << "GLFW error " << e << ": " << d << '\n';
@@ -200,20 +204,27 @@ int main(int argc, char **argv)
     g_dl.is_dl = 1;
 
     for (int s = 0; s < SLOTS_PER_FRAME; s++)
-        g_cur_dl[s] = g_cur_ul[s] = g_pk_dl[s] = g_pk_ul[s] = FLOOR_DB;
+        g_cur_dl[s] = g_cur_ul[s] = g_pk_dl[s] = g_pk_ul[s] = (float)FLOOR_DB;
 
-    /* stairs need one extra point so the last slot is closed off */
-    static double xs[SLOTS_PER_FRAME + 1];
-    for (int s = 0; s <= SLOTS_PER_FRAME; s++) xs[s] = s;
+    static double xd[SLOTS_PER_FRAME], xu[SLOTS_PER_FRAME];
+    static double yd[SLOTS_PER_FRAME], yu[SLOTS_PER_FRAME];
+    static double kd[SLOTS_PER_FRAME], ku[SLOTS_PER_FRAME];
+    for (int s = 0; s < SLOTS_PER_FRAME; s++) { xd[s] = s - 0.21; xu[s] = s + 0.21; }
 
-    static double grid[SLOTS_PER_FRAME + 1];
-    for (int s = 0; s <= SLOTS_PER_FRAME; s++) grid[s] = s;
+    static double      tick_pos[SLOTS_PER_FRAME];
+    static char        tick_buf[SLOTS_PER_FRAME][4];
+    static const char *tick_lbl[SLOTS_PER_FRAME];
+    for (int s = 0; s < SLOTS_PER_FRAME; s++) {
+        tick_pos[s] = s;
+        snprintf(tick_buf[s], sizeof tick_buf[s], "%d", s);
+        tick_lbl[s] = tick_buf[s];
+    }
 
     glfwSetErrorCallback(glfwErrorCallback);
     if (!glfwInit()) { std::cerr << "glfwInit failed\n"; return 1; }
 
     glfwDefaultWindowHints();
-    GLFWwindow *window = glfwCreateWindow(1300, 700,
+    GLFWwindow *window = glfwCreateWindow(1400, 780,
                                           "Split 8 fronthaul scope",
                                           nullptr, nullptr);
     if (!window) { std::cerr << "no window - is DISPLAY set?\n"; glfwTerminate(); return 1; }
@@ -227,7 +238,9 @@ int main(int argc, char **argv)
     ImGui::CreateContext();
     ImPlot::CreateContext();
     ImGui::StyleColorsDark();
+
     ImGuiIO &io = ImGui::GetIO();
+    io.FontGlobalScale = 1.35f;          /* readable from across the room */
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
@@ -235,8 +248,8 @@ int main(int argc, char **argv)
     std::thread cap(capture_thread, argv[1]);
     std::thread sta(stats_thread);
 
-    static double yd[SLOTS_PER_FRAME + 1], yu[SLOTS_PER_FRAME + 1];
-    static double qd[SLOTS_PER_FRAME + 1], qu[SLOTS_PER_FRAME + 1];
+    const ImVec4 COL_DL(1.00f, 0.78f, 0.15f, 1.0f);
+    const ImVec4 COL_UL(0.25f, 0.85f, 0.45f, 1.0f);
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -254,55 +267,63 @@ int main(int argc, char **argv)
 
         uint32_t drop = g_drop.load(), ifdrop = g_ifdrop.load();
 
-        ImGui::Text("%s   DL src %s   |   DL %llu pkts %llu frames %u/640   |   UL %llu pkts %llu frames %u/640",
-                    argv[1], argv[2],
-                    (unsigned long long)g_pkts_dl.load(),
-                    (unsigned long long)g_frames_dl.load(), g_cells_dl.load(),
-                    (unsigned long long)g_pkts_ul.load(),
-                    (unsigned long long)g_frames_ul.load(), g_cells_ul.load());
+        ImGui::TextColored(COL_DL, "DL  gNB -> UE");
+        ImGui::SameLine();
+        ImGui::TextColored(COL_UL, "    UL  UE -> gNB");
+        ImGui::SameLine();
+        ImGui::Text("     %s   %u/640 cells DL   %u/640 cells UL",
+                    argv[1], g_cells_dl.load(), g_cells_ul.load());
 
         if (drop || ifdrop)
-            ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1),
-                               "drop=+%u ifdrop=+%u  << LOSSY    %.0f FPS", drop, ifdrop, io.Framerate);
+            ImGui::TextColored(ImVec4(1, 0.25f, 0.25f, 1),
+                               "LOSSY  drop=+%u ifdrop=+%u   -- trace has holes, do not trust it",
+                               drop, ifdrop);
         else
             ImGui::TextColored(ImVec4(0.3f, 1, 0.3f, 1),
-                               "drop=+0 ifdrop=+0  clean    %.0f FPS", io.Framerate);
+                               "clean  drop=0 ifdrop=0");
 
-        ImGui::Checkbox("peak hold", &g_show_pk);
+        ImGui::Checkbox("peak hold outline", &g_show_pk);
         ImGui::SameLine();
         if (ImGui::Button("reset peak")) g_reset_pk.store(true);
 
         for (int s = 0; s < SLOTS_PER_FRAME; s++) {
-            yd[s] = g_cur_dl[s];  yu[s] = g_cur_ul[s];
-            qd[s] = g_pk_dl[s];   qu[s] = g_pk_ul[s];
+            yd[s] = g_cur_dl[s] - FLOOR_DB;  if (yd[s] < 0) yd[s] = 0;
+            yu[s] = g_cur_ul[s] - FLOOR_DB;  if (yu[s] < 0) yu[s] = 0;
+            kd[s] = g_pk_dl[s]  - FLOOR_DB;  if (kd[s] < 0) kd[s] = 0;
+            ku[s] = g_pk_ul[s]  - FLOOR_DB;  if (ku[s] < 0) ku[s] = 0;
         }
-        yd[SLOTS_PER_FRAME] = yd[SLOTS_PER_FRAME - 1];
-        yu[SLOTS_PER_FRAME] = yu[SLOTS_PER_FRAME - 1];
-        qd[SLOTS_PER_FRAME] = qd[SLOTS_PER_FRAME - 1];
-        qu[SLOTS_PER_FRAME] = qu[SLOTS_PER_FRAME - 1];
 
-        if (ImPlot::BeginPlot("##scope", ImVec2(-1, -1))) {
+        if (ImPlot::BeginPlot("##bars", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
             ImPlot::SetupAxes("slot", "power  (dBFS)");
-            ImPlot::SetupAxisLimits(ImAxis_X1, 0, SLOTS_PER_FRAME, ImPlotCond_Always);
-            ImPlot::SetupAxisLimits(ImAxis_Y1, -130, 0, ImPlotCond_Always);
-            ImPlot::SetupAxisFormat(ImAxis_X1, "%g");
-
-            /* slot boundaries */
-            ImPlot::SetNextLineStyle(ImVec4(0.40f, 0.40f, 0.40f, 0.45f), 1.0f);
-            ImPlot::PlotInfLines("##grid", grid, SLOTS_PER_FRAME + 1);
+            ImPlot::SetupAxisLimits(ImAxis_X1, -0.7, SLOTS_PER_FRAME - 0.3, ImPlotCond_Always);
+            ImPlot::SetupAxisLimits(ImAxis_Y1, 0, 120, ImPlotCond_Always);
+            ImPlot::SetupAxisTicks(ImAxis_X1, tick_pos, SLOTS_PER_FRAME, tick_lbl);
+            ImPlot::SetupAxisFormat(ImAxis_Y1, fmt_dbfs);
 
             if (g_show_pk) {
-                ImPlot::SetNextLineStyle(ImVec4(1.00f, 0.90f, 0.20f, 0.40f), 1.0f);
-                ImPlot::PlotStairs("DL peak", xs, qd, SLOTS_PER_FRAME + 1);
-                ImPlot::SetNextLineStyle(ImVec4(0.30f, 1.00f, 0.40f, 0.40f), 1.0f);
-                ImPlot::PlotStairs("UL peak", xs, qu, SLOTS_PER_FRAME + 1);
+                ImPlot::SetNextFillStyle(COL_DL, 0.18f);
+                ImPlot::PlotBars("##pkdl", xd, kd, SLOTS_PER_FRAME, 0.40);
+                ImPlot::SetNextFillStyle(COL_UL, 0.18f);
+                ImPlot::PlotBars("##pkul", xu, ku, SLOTS_PER_FRAME, 0.40);
             }
 
-            ImPlot::SetNextLineStyle(ImVec4(1.00f, 0.90f, 0.20f, 1.0f), 2.5f);
-            ImPlot::PlotStairs("DL  gNB -> UE", xs, yd, SLOTS_PER_FRAME + 1);
+            ImPlot::SetNextFillStyle(COL_DL, 1.0f);
+            ImPlot::PlotBars("DL", xd, yd, SLOTS_PER_FRAME, 0.40);
+            ImPlot::SetNextFillStyle(COL_UL, 1.0f);
+            ImPlot::PlotBars("UL", xu, yu, SLOTS_PER_FRAME, 0.40);
 
-            ImPlot::SetNextLineStyle(ImVec4(0.30f, 1.00f, 0.40f, 1.0f), 2.5f);
-            ImPlot::PlotStairs("UL  UE -> gNB", xs, yu, SLOTS_PER_FRAME + 1);
+            /* print the value on top of every bar that is not silent */
+            char lab[16];
+            for (int s = 0; s < SLOTS_PER_FRAME; s++) {
+                if (yd[s] > 1.0) {
+                    snprintf(lab, sizeof lab, "%.0f", g_cur_dl[s]);
+                    ImPlot::PlotText(lab, xd[s], yd[s] + 5.0);
+                }
+                if (yu[s] > 1.0) {
+                    snprintf(lab, sizeof lab, "%.0f", g_cur_ul[s]);
+                    ImPlot::PlotText(lab, xu[s], yu[s] + 5.0);
+                }
+            }
 
             ImPlot::EndPlot();
         }
@@ -313,7 +334,7 @@ int main(int argc, char **argv)
         int w, h;
         glfwGetFramebufferSize(window, &w, &h);
         glViewport(0, 0, w, h);
-        glClearColor(0.05f, 0.05f, 0.07f, 1.00f);
+        glClearColor(0.07f, 0.08f, 0.10f, 1.00f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
