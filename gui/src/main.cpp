@@ -197,6 +197,7 @@ static double g_xs[PKTS_PER_FRAME];
 static double g_grid[SLOTS_PER_FRAME + 1];
 static double g_lo[PKTS_PER_FRAME], g_hi[PKTS_PER_FRAME];
 static double g_plo[PKTS_PER_FRAME], g_phi[PKTS_PER_FRAME];
+static double g_mid[PKTS_PER_FRAME];
 
 static double      g_tick_pos[SLOTS_PER_FRAME];
 static char        g_tick_buf[SLOTS_PER_FRAME][4];
@@ -241,6 +242,13 @@ static void draw_trace(const char *title,
         /* live envelope */
         ImPlot::SetNextFillStyle(col, 1.0f);
         ImPlot::PlotShaded("##env", g_xs, g_lo, g_hi, PKTS_PER_FRAME);
+
+        /* centre line, so the trace stays continuous through silent slots
+         * where min and max are both zero and the band has no height */
+        for (int c = 0; c < PKTS_PER_FRAME; c++)
+            g_mid[c] = 0.5 * (g_lo[c] + g_hi[c]);
+        ImPlot::SetNextLineStyle(col, 1.6f);
+        ImPlot::PlotLine("##mid", g_xs, g_mid, PKTS_PER_FRAME);
 
         ImPlot::EndPlot();
     }
