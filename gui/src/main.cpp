@@ -1,9 +1,12 @@
 /* -------------------------------------------------------------------------
  * Split 8 fronthaul scope
  *
- * One bar per slot per direction, with the dBFS value printed on the bar.
- * X axis is the slot number 0..19. Taller bar = more power. Silent slots
- * have no bar at all.
+ * Two stacked plots sharing one X axis in slot units (0..20). Each
+ * direction has its own Y axis, auto-ranged to its own signal, because
+ * the uplink sits 30-40 dB below the downlink.
+ *
+ * The trace is drawn at per-packet resolution - 32 points per slot,
+ * 640 across the frame - so it reads as a continuous waveform.
  *
  * Run:  ./build/src/imgui_app <iface> <dl-src-mac>
  *       sudo setcap "cap_net_raw,cap_net_admin=eip" ./build/src/imgui_app
@@ -35,17 +38,14 @@
 #define PKTS_PER_SLOT     32
 #define SLOTS_PER_FRAME   20
 #define PKTS_PER_FRAME    640
-#define SAMPLES_PER_SLOT  61440
 #define FULL_SCALE        32767.0
+#define FLOOR_DB          (-110.0f)
 
-#define FLOOR_DB          (-110.0)      /* bottom of the bar chart */
+static float g_dl_trace[PKTS_PER_FRAME], g_ul_trace[PKTS_PER_FRAME];
+static float g_dl_peak[PKTS_PER_FRAME],  g_ul_peak[PKTS_PER_FRAME];
 
-static float g_cur_dl[SLOTS_PER_FRAME], g_cur_ul[SLOTS_PER_FRAME];
-static float g_pk_dl[SLOTS_PER_FRAME],  g_pk_ul[SLOTS_PER_FRAME];
-
-static std::atomic<uint64_t> g_pkts_dl(0), g_pkts_ul(0);
-static std::atomic<uint64_t> g_frames_dl(0), g_frames_ul(0);
 static std::atomic<uint32_t> g_cells_dl(0), g_cells_ul(0);
+static std::atomic<uint64_t> g_frames_dl(0), g_frames_ul(0);
 static std::atomic<uint32_t> g_drop(0), g_ifdrop(0);
 static std::atomic<uint64_t> g_bad(0), g_trunc(0);
 static std::atomic<bool>     g_running(true);
@@ -54,10 +54,11 @@ static std::atomic<bool>     g_reset_pk(false);
 static pcap_t      *g_ph = NULL;
 static unsigned char g_dl_mac[6];
 
-static bool g_show_pk = true;
+static bool g_show_pk  = true;
+static bool g_autofit  = true;
 
 typedef struct {
-    uint64_t acc[SLOTS_PER_FRAME];
+    uint64_t acc[PKTS_PER_FRAME];
     uint8_t  seen[PKTS_PER_FRAME];
     uint32_t last_cell;
     int      started;
@@ -68,24 +69,24 @@ static dir_t g_dl, g_ul;
 
 static void finish_frame(dir_t *d)
 {
-    float *cur = d->is_dl ? g_cur_dl : g_cur_ul;
-    float *pk  = d->is_dl ? g_pk_dl  : g_pk_ul;
+    float *tr = d->is_dl ? g_dl_trace : g_ul_trace;
+    float *pk = d->is_dl ? g_dl_peak  : g_ul_peak;
 
     bool clear = g_reset_pk.exchange(false);
 
     uint32_t have = 0;
-    for (uint32_t c = 0; c < PKTS_PER_FRAME; c++) have += d->seen[c];
+    for (uint32_t c = 0; c < PKTS_PER_FRAME; c++) {
+        have += d->seen[c];
 
-    for (uint32_t s = 0; s < SLOTS_PER_FRAME; s++) {
-        float db = (float)FLOOR_DB;
-        if (d->acc[s] > 0) {
-            double mean = (double)d->acc[s] / (double)SAMPLES_PER_SLOT;
+        float db = FLOOR_DB;
+        if (d->acc[c] > 0) {
+            double mean = (double)d->acc[c] / (double)(SAMPLES_PER_PKT * 2);
             db = (float)(10.0 * log10(mean / (FULL_SCALE * FULL_SCALE)));
-            if (db < FLOOR_DB) db = (float)FLOOR_DB;
+            if (db < FLOOR_DB) db = FLOOR_DB;
         }
-        cur[s] = db;
-        if (clear || db > pk[s]) pk[s] = db;
-        d->acc[s] = 0;
+        tr[c] = db;
+        if (clear || db > pk[c]) pk[c] = db;
+        d->acc[c] = 0;
     }
 
     memset(d->seen, 0, sizeof d->seen);
@@ -94,6 +95,7 @@ static void finish_frame(dir_t *d)
     else          { g_frames_ul++; g_cells_ul.store(have); }
 }
 
+/* hot path: each sample touched once, integer arithmetic, no frame buffer */
 static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
                       const unsigned char *bytes)
 {
@@ -114,8 +116,6 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
     int is_dl = (memcmp(bytes + 6, g_dl_mac, 6) == 0);
     dir_t *d  = is_dl ? &g_dl : &g_ul;
 
-    if (is_dl) g_pkts_dl++; else g_pkts_ul++;
-
     if (d->started && cell < d->last_cell) finish_frame(d);
     d->started   = 1;
     d->last_cell = cell;
@@ -127,7 +127,7 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
         acc += (uint64_t)(s * s);
     }
 
-    d->acc[cell / PKTS_PER_SLOT] += acc;
+    d->acc[cell] += acc;
     d->seen[cell] = 1;
 }
 
@@ -173,15 +173,56 @@ static void capture_thread(const char *iface)
     pcap_loop(g_ph, -1, on_packet, NULL);
 }
 
-/* y axis holds "height above the floor"; print it back as real dBFS */
-static int fmt_dbfs(double v, char *buf, int size, void *)
-{
-    return snprintf(buf, size, "%.0f", v + FLOOR_DB);
-}
-
 static void glfwErrorCallback(int e, const char *d)
 {
     std::cerr << "GLFW error " << e << ": " << d << '\n';
+}
+
+static double g_xs[PKTS_PER_FRAME];
+static double g_grid[SLOTS_PER_FRAME + 1];
+static double g_y[PKTS_PER_FRAME], g_p[PKTS_PER_FRAME];
+
+static double      g_tick_pos[SLOTS_PER_FRAME];
+static char        g_tick_buf[SLOTS_PER_FRAME][4];
+static const char *g_tick_lbl[SLOTS_PER_FRAME];
+
+static void draw_trace(const char *title, const float *tr, const float *pk,
+                       ImVec4 col, bool show_x)
+{
+    for (int c = 0; c < PKTS_PER_FRAME; c++) {
+        g_y[c] = tr[c];
+        g_p[c] = pk[c];
+    }
+
+    ImPlotAxisFlags xf = ImPlotAxisFlags_Lock;
+    if (!show_x) xf |= ImPlotAxisFlags_NoTickLabels;
+
+    ImPlotAxisFlags yf = g_autofit ? ImPlotAxisFlags_AutoFit : 0;
+
+    if (ImPlot::BeginPlot(title, ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
+        ImPlot::SetupAxes(show_x ? "slot" : NULL, "dBFS", xf, yf);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0, SLOTS_PER_FRAME, ImPlotCond_Always);
+        if (!g_autofit)
+            ImPlot::SetupAxisLimits(ImAxis_Y1, FLOOR_DB, 0, ImPlotCond_Always);
+        ImPlot::SetupAxisTicks(ImAxis_X1, g_tick_pos, SLOTS_PER_FRAME, g_tick_lbl);
+
+        /* slot boundaries */
+        ImPlot::SetNextLineStyle(ImVec4(0.45f, 0.45f, 0.45f, 0.35f), 1.0f);
+        ImPlot::PlotInfLines("##grid", g_grid, SLOTS_PER_FRAME + 1);
+
+        if (g_show_pk) {
+            ImPlot::SetNextLineStyle(ImVec4(col.x, col.y, col.z, 0.35f), 1.0f);
+            ImPlot::PlotLine("##peak", g_xs, g_p, PKTS_PER_FRAME);
+        }
+
+        ImPlot::SetNextFillStyle(col, 0.22f);
+        ImPlot::PlotShaded("##fill", g_xs, g_y, PKTS_PER_FRAME, (double)FLOOR_DB);
+
+        ImPlot::SetNextLineStyle(col, 2.0f);
+        ImPlot::PlotLine("##trace", g_xs, g_y, PKTS_PER_FRAME);
+
+        ImPlot::EndPlot();
+    }
 }
 
 int main(int argc, char **argv)
@@ -203,28 +244,23 @@ int main(int argc, char **argv)
     memset(&g_ul, 0, sizeof g_ul);
     g_dl.is_dl = 1;
 
-    for (int s = 0; s < SLOTS_PER_FRAME; s++)
-        g_cur_dl[s] = g_cur_ul[s] = g_pk_dl[s] = g_pk_ul[s] = (float)FLOOR_DB;
-
-    static double xd[SLOTS_PER_FRAME], xu[SLOTS_PER_FRAME];
-    static double yd[SLOTS_PER_FRAME], yu[SLOTS_PER_FRAME];
-    static double kd[SLOTS_PER_FRAME], ku[SLOTS_PER_FRAME];
-    for (int s = 0; s < SLOTS_PER_FRAME; s++) { xd[s] = s - 0.21; xu[s] = s + 0.21; }
-
-    static double      tick_pos[SLOTS_PER_FRAME];
-    static char        tick_buf[SLOTS_PER_FRAME][4];
-    static const char *tick_lbl[SLOTS_PER_FRAME];
+    for (int c = 0; c < PKTS_PER_FRAME; c++) {
+        g_dl_trace[c] = g_ul_trace[c] = FLOOR_DB;
+        g_dl_peak[c]  = g_ul_peak[c]  = FLOOR_DB;
+        g_xs[c] = (double)c / (double)PKTS_PER_SLOT;   /* x in slot units */
+    }
+    for (int s = 0; s <= SLOTS_PER_FRAME; s++) g_grid[s] = s;
     for (int s = 0; s < SLOTS_PER_FRAME; s++) {
-        tick_pos[s] = s;
-        snprintf(tick_buf[s], sizeof tick_buf[s], "%d", s);
-        tick_lbl[s] = tick_buf[s];
+        g_tick_pos[s] = s + 0.5;                       /* centre of the slot */
+        snprintf(g_tick_buf[s], sizeof g_tick_buf[s], "%d", s);
+        g_tick_lbl[s] = g_tick_buf[s];
     }
 
     glfwSetErrorCallback(glfwErrorCallback);
     if (!glfwInit()) { std::cerr << "glfwInit failed\n"; return 1; }
 
     glfwDefaultWindowHints();
-    GLFWwindow *window = glfwCreateWindow(1400, 780,
+    GLFWwindow *window = glfwCreateWindow(1400, 820,
                                           "Split 8 fronthaul scope",
                                           nullptr, nullptr);
     if (!window) { std::cerr << "no window - is DISPLAY set?\n"; glfwTerminate(); return 1; }
@@ -240,7 +276,7 @@ int main(int argc, char **argv)
     ImGui::StyleColorsDark();
 
     ImGuiIO &io = ImGui::GetIO();
-    io.FontGlobalScale = 1.35f;          /* readable from across the room */
+    io.FontGlobalScale = 1.25f;
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
@@ -267,65 +303,27 @@ int main(int argc, char **argv)
 
         uint32_t drop = g_drop.load(), ifdrop = g_ifdrop.load();
 
-        ImGui::TextColored(COL_DL, "DL  gNB -> UE");
-        ImGui::SameLine();
-        ImGui::TextColored(COL_UL, "    UL  UE -> gNB");
-        ImGui::SameLine();
-        ImGui::Text("     %s   %u/640 cells DL   %u/640 cells UL",
-                    argv[1], g_cells_dl.load(), g_cells_ul.load());
+        ImGui::Text("%s   DL src %s   |   %u/640 cells DL   %u/640 cells UL",
+                    argv[1], argv[2], g_cells_dl.load(), g_cells_ul.load());
 
         if (drop || ifdrop)
             ImGui::TextColored(ImVec4(1, 0.25f, 0.25f, 1),
-                               "LOSSY  drop=+%u ifdrop=+%u   -- trace has holes, do not trust it",
+                               "LOSSY  drop=+%u ifdrop=+%u   -- trace has holes",
                                drop, ifdrop);
         else
-            ImGui::TextColored(ImVec4(0.3f, 1, 0.3f, 1),
-                               "clean  drop=0 ifdrop=0");
+            ImGui::TextColored(ImVec4(0.3f, 1, 0.3f, 1), "clean  drop=0 ifdrop=0");
 
-        ImGui::Checkbox("peak hold outline", &g_show_pk);
+        ImGui::Checkbox("peak hold", &g_show_pk);
         ImGui::SameLine();
         if (ImGui::Button("reset peak")) g_reset_pk.store(true);
+        ImGui::SameLine();
+        ImGui::Checkbox("auto range each axis", &g_autofit);
 
-        for (int s = 0; s < SLOTS_PER_FRAME; s++) {
-            yd[s] = g_cur_dl[s] - FLOOR_DB;  if (yd[s] < 0) yd[s] = 0;
-            yu[s] = g_cur_ul[s] - FLOOR_DB;  if (yu[s] < 0) yu[s] = 0;
-            kd[s] = g_pk_dl[s]  - FLOOR_DB;  if (kd[s] < 0) kd[s] = 0;
-            ku[s] = g_pk_ul[s]  - FLOOR_DB;  if (ku[s] < 0) ku[s] = 0;
-        }
-
-        if (ImPlot::BeginPlot("##bars", ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
-            ImPlot::SetupAxes("slot", "power  (dBFS)");
-            ImPlot::SetupAxisLimits(ImAxis_X1, -0.7, SLOTS_PER_FRAME - 0.3, ImPlotCond_Always);
-            ImPlot::SetupAxisLimits(ImAxis_Y1, 0, 120, ImPlotCond_Always);
-            ImPlot::SetupAxisTicks(ImAxis_X1, tick_pos, SLOTS_PER_FRAME, tick_lbl);
-            ImPlot::SetupAxisFormat(ImAxis_Y1, fmt_dbfs);
-
-            if (g_show_pk) {
-                ImPlot::SetNextFillStyle(COL_DL, 0.18f);
-                ImPlot::PlotBars("##pkdl", xd, kd, SLOTS_PER_FRAME, 0.40);
-                ImPlot::SetNextFillStyle(COL_UL, 0.18f);
-                ImPlot::PlotBars("##pkul", xu, ku, SLOTS_PER_FRAME, 0.40);
-            }
-
-            ImPlot::SetNextFillStyle(COL_DL, 1.0f);
-            ImPlot::PlotBars("DL", xd, yd, SLOTS_PER_FRAME, 0.40);
-            ImPlot::SetNextFillStyle(COL_UL, 1.0f);
-            ImPlot::PlotBars("UL", xu, yu, SLOTS_PER_FRAME, 0.40);
-
-            /* print the value on top of every bar that is not silent */
-            char lab[16];
-            for (int s = 0; s < SLOTS_PER_FRAME; s++) {
-                if (yd[s] > 1.0) {
-                    snprintf(lab, sizeof lab, "%.0f", g_cur_dl[s]);
-                    ImPlot::PlotText(lab, xd[s], yd[s] + 5.0);
-                }
-                if (yu[s] > 1.0) {
-                    snprintf(lab, sizeof lab, "%.0f", g_cur_ul[s]);
-                    ImPlot::PlotText(lab, xu[s], yu[s] + 5.0);
-                }
-            }
-
-            ImPlot::EndPlot();
+        if (ImPlot::BeginSubplots("##stack", 2, 1, ImVec2(-1, -1),
+                                  ImPlotSubplotFlags_LinkCols)) {
+            draw_trace("DL   gNB -> UE", g_dl_trace, g_dl_peak, COL_DL, false);
+            draw_trace("UL   UE -> gNB", g_ul_trace, g_ul_peak, COL_UL, true);
+            ImPlot::EndSubplots();
         }
 
         ImGui::End();
