@@ -2,54 +2,57 @@
  * live3.c - live Split 8 fronthaul display
  *
  *   gcc -O3 -march=native -o live3 live3.c -lpcap -lm
- *   sudo ./live3 sfp1 bc:24:11:ec:73:d3
+ *   sudo ./live3 sfp1 bc:24:11:ec:73:d3        bar display per slot
+ *   sudo ./live3 -g sfp1 bc:24:11:ec:73:d3     oscilloscope trace
  *
- * Same display as before: peak dBFS per slot per direction, redrawn once a
- * second, slot number on both columns. Four corrections and two new
- * measurements.
+ * Options
+ *   -g              draw the frame as a trace instead of per-slot bars
+ *   -e <ethertype>  default 0xaefe
+ *   -l              per-frame log to stderr:  D|U <frame> <20 slot values>
  *
- * Corrections
+ * The trace view
+ *
+ *   One 10 ms radio frame across the width of the terminal, both directions,
+ *   at the resolution the fronthaul actually carries: one point per eCPRI
+ *   packet, 1920 samples, 15.625 us. 640 points are folded into 80 columns
+ *   by taking the loudest of each group of 8 - the same peak detection a
+ *   digital scope does per pixel column.
+ *
+ *   Each direction is auto-ranged over its own 40 dB window, because the
+ *   uplink runs 30-40 dB below the downlink and a shared scale would flatten
+ *   it. The dB at the top of each lane is printed beside it.
+ *
+ *   Slot boundaries fall every 4 columns, so the grid under the trace is the
+ *   twenty slots of the frame.
+ *
+ * Corrections carried from earlier versions
  *
  *   1. The redraw is driven by the wall clock, not by packet arrival. It
  *      used to redraw from inside the packet callback, so a silent link
- *      froze the screen and looked exactly like a hung program. Now a dead
- *      mirror shows all -120 with the counters stopped, and says so.
+ *      froze the screen and looked exactly like a hung program.
  *
  *   2. A frame boundary needs a LARGE backward step in the cell number. Any
  *      backward step used to end the frame, so a two-packet reordering split
- *      one frame into two. A real wrap goes 639 -> 0; a reordering moves by
- *      one or two. Small ones now increment 'reorder' instead.
+ *      one frame into two. Small ones now increment 'reorder' instead.
  *
  *   3. Energy is divided by the samples actually received, not by the
- *      theoretical 61440. A slot missing packets used to read LOW, so the
- *      tool quietly under-reported power instead of flagging it.
+ *      theoretical 61440, so a slot missing packets reports its true level
+ *      instead of reading low.
  *
  *   4. Frames with holes are counted and the cell count is shown as a range.
- *      'cells_max' alone was the most flattering number available.
  *
  * New measurements
  *
  *   TIMING. seq_id is an address, not a clock - a packet that is correctly
  *   addressed but transmitted late still reports its correct slot. So the
- *   arrival timestamp is now compared against where the packet claims to be:
- *
- *     cell c should arrive 15.625 us after cell c-1
- *     the DL and UL frames should start at the same moment
- *
- *   A transmitter running late shows up as a positive deviation in
- *   microseconds, and a whole direction running late shows up as frame skew.
- *   Neither is visible from seq_id alone.
+ *   arrival timestamp is compared against where the packet claims to be, and
+ *   the DL and UL frame starts are compared with each other. A transmitter
+ *   running late shows as microseconds of skew; seq_id alone cannot show it.
  *
  *   TDD VIOLATION. On this testbed slots 0-6 and 10-16 are downlink only.
- *   Uplink energy in one of them is physically impossible on the air and
- *   means the UE placed samples in the wrong slot. On a cabled fronthaul
- *   there is no RF switch to prevent it, so the mirror would carry it. Any
- *   such event is now latched and printed rather than left for the operator
- *   to notice among twenty numbers.
- *
- * Options
- *   -e <ethertype>  default 0xaefe
- *   -l              per-frame log to stderr:  D|U <frame> <20 slot values>
+ *   Uplink energy in one of them means the UE placed samples in the wrong
+ *   slot - on a cabled fronthaul there is no RF switch to prevent it. Any
+ *   such event is latched and printed rather than left to be noticed.
  * ---------------------------------------------------------------------- */
 
 #define _GNU_SOURCE
@@ -79,17 +82,24 @@
 #define US_PER_PKT       15.625          /* 1920 samples at 122.88 Msps */
 #define WRAP_MIN         (PKTS_PER_FRAME / 2)
 
-/* This testbed: 5 ms pattern, 7 DL slots, 1 mixed, 2 UL, repeating twice
-   per 10 ms frame. Slots 0-6 and 10-16 can never carry uplink. Slot 7 and
-   17 are mixed: 6 DL symbols, 4 guard, 4 UL. */
+/* trace geometry: 640 cells / 8 = 80 columns, 4 columns per slot */
+#define COLS               80
+#define CELLS_PER_COL      (PKTS_PER_FRAME / COLS)
+#define COLS_PER_SLOT      (COLS / SLOTS_PER_FRAME)
+#define ROWS               10
+#define RANGE_DB           40.0
+
+/* This testbed: 5 ms pattern, 7 DL slots, 1 mixed, 2 UL, repeating twice per
+   10 ms frame. Slots 0-6 and 10-16 can never carry uplink. */
 static int is_dl_only(uint32_t slot) { return (slot % 10) <= 6; }
 
 typedef struct {
     const char *name;
     char        tag;
-    uint64_t    acc[SLOTS_PER_FRAME];    /* sum of I^2 + Q^2 */
-    uint64_t    nsamp[SLOTS_PER_FRAME];  /* samples actually summed */
-    double      peak[SLOTS_PER_FRAME];   /* loudest dBFS this second */
+    uint64_t    acc[PKTS_PER_FRAME];     /* sum of I^2 + Q^2, per packet  */
+    uint64_t    nsamp[PKTS_PER_FRAME];   /* samples actually summed       */
+    float       cell_peak[PKTS_PER_FRAME];  /* loudest dBFS this second   */
+    double      peak[SLOTS_PER_FRAME];
     uint8_t     seen[PKTS_PER_FRAME];
     uint32_t    last_cell;
     uint32_t    cells_min, cells_max;
@@ -98,7 +108,7 @@ typedef struct {
 
     struct timeval t0;                   /* when cell 0 of this frame arrived */
     int           t0_valid;
-    double        late_max;              /* worst deviation this second, us */
+    double        late_max;              /* worst deviation this second, us   */
 } dir_t;
 
 static dir_t g_dl = { "DL (gNB -> UE)", 'D' };
@@ -110,11 +120,9 @@ static uint64_t g_bad, g_trunc, g_reorder;
 static uint32_t g_prev_drop, g_prev_ifdrop;
 static time_t   g_last_print;
 static volatile sig_atomic_t g_run = 1;
-static int      g_log = 0;
+static int      g_log = 0, g_graph = 0;
 
-/* latched TDD violation */
-static uint64_t g_viol_n;
-static uint64_t g_viol_frame;
+static uint64_t g_viol_n, g_viol_frame;
 static uint32_t g_viol_slot;
 static double   g_viol_db;
 
@@ -130,6 +138,14 @@ static int parse_mac(const char *s, uint8_t m[6])
                   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6 ? 0 : -1;
 }
 
+static double to_db(uint64_t acc, uint64_t n)
+{
+    if (n == 0 || acc == 0) return SILENT_DB;
+    double db = 10.0 * log10(((double)acc / (double)n)
+                             / (FULL_SCALE * FULL_SCALE));
+    return db < SILENT_DB ? SILENT_DB : db;
+}
+
 static void finish_frame(dir_t *d)
 {
     double cur[SLOTS_PER_FRAME];
@@ -141,18 +157,24 @@ static void finish_frame(dir_t *d)
     if (have < PKTS_PER_FRAME) d->partial++;
 
     for (uint32_t s = 0; s < SLOTS_PER_FRAME; s++) {
-        double db = SILENT_DB;
-        if (d->nsamp[s] > 0 && d->acc[s] > 0) {
-            double mean = (double)d->acc[s] / (double)d->nsamp[s];
-            db = 10.0 * log10(mean / (FULL_SCALE * FULL_SCALE));
-            if (db < SILENT_DB) db = SILENT_DB;
+        uint64_t sacc = 0, sn = 0;
+
+        for (uint32_t k = 0; k < PKTS_PER_SLOT; k++) {
+            uint32_t c = s * PKTS_PER_SLOT + k;
+            sacc += d->acc[c];
+            sn   += d->nsamp[c];
+
+            float cdb = (float)to_db(d->acc[c], d->nsamp[c]);
+            if (cdb > d->cell_peak[c]) d->cell_peak[c] = cdb;
+
+            d->acc[c]   = 0;
+            d->nsamp[c] = 0;
         }
+
+        double db = to_db(sacc, sn);
         cur[s] = db;
         if (db > d->peak[s]) d->peak[s] = db;
-        d->acc[s]   = 0;
-        d->nsamp[s] = 0;
 
-        /* uplink energy where the TDD pattern forbids it */
         if (d->tag == 'U' && is_dl_only(s) && db > QUIET_DB) {
             g_viol_n++;
             g_viol_frame = d->fno;
@@ -176,10 +198,10 @@ static void finish_frame(dir_t *d)
     d->frames++;
 }
 
-/* the one-second display window; fno and the timing reference are NOT reset */
 static void reset_window(dir_t *d)
 {
     for (uint32_t s = 0; s < SLOTS_PER_FRAME; s++) d->peak[s] = SILENT_DB;
+    for (uint32_t c = 0; c < PKTS_PER_FRAME; c++) d->cell_peak[c] = SILENT_DB;
     d->cells_max = 0;
     d->cells_min = PKTS_PER_FRAME;
     d->frames = d->partial = d->pkts = 0;
@@ -196,11 +218,64 @@ static void bar(char *o, double db)
     o[BARW] = '\0';
 }
 
-/* microseconds from a to b */
 static double us_between(const struct timeval *a, const struct timeval *b)
 {
     return (double)(b->tv_sec - a->tv_sec) * 1e6
          + (double)(b->tv_usec - a->tv_usec);
+}
+
+/* one direction as a scope trace: 640 packets folded to 80 columns by peak
+   detection, auto-ranged over its own 40 dB window */
+static void draw_trace(const dir_t *d)
+{
+    double col[COLS];
+    double top = SILENT_DB;
+
+    for (int c = 0; c < COLS; c++) {
+        double m = SILENT_DB;
+        for (int k = 0; k < CELLS_PER_COL; k++) {
+            double v = d->cell_peak[c * CELLS_PER_COL + k];
+            if (v > m) m = v;
+        }
+        col[c] = m;
+        if (m > top) top = m;
+    }
+
+    if (top <= QUIET_DB) {
+        printf("  %-16s  silent\n", d->name);
+        return;
+    }
+
+    top = ceil(top / 5.0) * 5.0;              /* round up to a 5 dB step */
+    double bot = top - RANGE_DB;
+
+    printf("  %-16s  top %+.0f dBFS, %.0f dB range\n",
+           d->name, top, RANGE_DB);
+
+    for (int r = ROWS - 1; r >= 0; r--) {
+        char line[COLS + 1];
+        for (int c = 0; c < COLS; c++) {
+            double frac = (col[c] - bot) / (top - bot);
+            int h = (int)(frac * ROWS + 0.5);
+            line[c] = (h > r) ? '#' : ' ';
+        }
+        line[COLS] = '\0';
+        printf("        |%s|\n", line);
+    }
+
+    printf("        |");
+    for (int c = 0; c < COLS; c++)
+        putchar((c % COLS_PER_SLOT == 0) ? '+' : '-');
+    printf("|\n");
+}
+
+static void draw_axis(void)
+{
+    printf("        ");
+    for (int s = 0; s < SLOTS_PER_FRAME; s += 2)
+        printf(" %-*d", COLS_PER_SLOT * 2 - 1, s);
+    printf("\n        slot, one 10 ms frame, %g us per column\n",
+           CELLS_PER_COL * US_PER_PKT);
 }
 
 static void draw(void)
@@ -216,13 +291,12 @@ static void draw(void)
 
     printf("\033[H\033[J");
 
-    printf("  Split 8 fronthaul   |   DL %lu pkts %lu frames cells %u..%u"
-           " partial %lu   |   UL %lu pkts %lu frames cells %u..%u"
-           " partial %lu\n",
-           (unsigned long)g_dl.pkts, (unsigned long)g_dl.frames,
+    printf("  Split 8 fronthaul   |   DL %lu pkts cells %u..%u partial %lu"
+           "   |   UL %lu pkts cells %u..%u partial %lu\n",
+           (unsigned long)g_dl.pkts,
            g_dl.cells_min > g_dl.cells_max ? 0 : g_dl.cells_min,
            g_dl.cells_max, (unsigned long)g_dl.partial,
-           (unsigned long)g_ul.pkts, (unsigned long)g_ul.frames,
+           (unsigned long)g_ul.pkts,
            g_ul.cells_min > g_ul.cells_max ? 0 : g_ul.cells_min,
            g_ul.cells_max, (unsigned long)g_ul.partial);
 
@@ -232,8 +306,6 @@ static void draw(void)
            (unsigned long)g_reorder,
            (d_drop || d_ifdrop) ? "<< LOSSY" : "clean");
 
-    /* frame skew: when UL cell 0 arrived relative to DL cell 0, folded into
-       +/- 5 ms since the frames repeat every 10 ms */
     double skew = 0.0;
     if (g_dl.t0_valid && g_ul.t0_valid) {
         skew = us_between(&g_dl.t0, &g_ul.t0);
@@ -247,16 +319,25 @@ static void draw(void)
     if (g_dl.pkts == 0 && g_ul.pkts == 0)
         printf("  no packets this second - is the mirror up?\n");
 
-    printf("\n  slot   %-*s          slot   %-*s\n",
-           BARW, g_dl.name, BARW, g_ul.name);
+    putchar('\n');
 
-    for (uint32_t s = 0; s < SLOTS_PER_FRAME; s++) {
-        char bd[BARW + 1], bu[BARW + 1];
-        bar(bd, g_dl.peak[s]);
-        bar(bu, g_ul.peak[s]);
-        printf("   %2u   |%s| %6.1f    %2u   |%s| %6.1f%s\n",
-               s, bd, g_dl.peak[s], s, bu, g_ul.peak[s],
-               (is_dl_only(s) && g_ul.peak[s] > QUIET_DB) ? "  << UL IN DL SLOT" : "");
+    if (g_graph) {
+        draw_trace(&g_dl);
+        putchar('\n');
+        draw_trace(&g_ul);
+        draw_axis();
+    } else {
+        printf("  slot   %-*s          slot   %-*s\n",
+               BARW, g_dl.name, BARW, g_ul.name);
+        for (uint32_t s = 0; s < SLOTS_PER_FRAME; s++) {
+            char bd[BARW + 1], bu[BARW + 1];
+            bar(bd, g_dl.peak[s]);
+            bar(bu, g_ul.peak[s]);
+            printf("   %2u   |%s| %6.1f    %2u   |%s| %6.1f%s\n",
+                   s, bd, g_dl.peak[s], s, bu, g_ul.peak[s],
+                   (is_dl_only(s) && g_ul.peak[s] > QUIET_DB)
+                     ? "  << UL IN DL SLOT" : "");
+        }
     }
 
     if (g_viol_n)
@@ -324,19 +405,18 @@ static void on_packet(unsigned char *user,
         n   += 2;
     }
 
-    uint32_t slot = cell / PKTS_PER_SLOT;
-    d->acc[slot]   += acc;
-    d->nsamp[slot] += n;
+    d->acc[cell]   += acc;
+    d->nsamp[cell] += n;
 }
 
 static void usage(const char *p)
 {
     fprintf(stderr,
-        "usage: sudo %s [-e ethertype] [-l] <iface> <gnb-mac>\n"
+        "usage: sudo %s [-g] [-e ethertype] [-l] <iface> <gnb-mac>\n"
+        "  -g              oscilloscope trace instead of per-slot bars\n"
         "  -e <ethertype>  default 0xaefe\n"
         "  -l              per-frame log to stderr\n"
-        "  e.g. sudo %s sfp1 bc:24:11:ec:73:d3\n"
-        "       sudo %s -l sfp1 bc:24:11:ec:73:d3 2> frames.log\n", p, p, p);
+        "  e.g. sudo %s -g sfp1 bc:24:11:ec:73:d3\n", p, p);
 }
 
 int main(int argc, char **argv)
@@ -345,8 +425,9 @@ int main(int argc, char **argv)
     unsigned ethertype = 0xaefe;
     int opt;
 
-    while ((opt = getopt(argc, argv, "e:lh")) != -1) {
+    while ((opt = getopt(argc, argv, "ge:lh")) != -1) {
         switch (opt) {
+        case 'g': g_graph = 1; break;
         case 'e': ethertype = (unsigned)strtoul(optarg, NULL, 0); break;
         case 'l': g_log = 1; break;
         default:  usage(argv[0]); return 1;
@@ -371,7 +452,7 @@ int main(int argc, char **argv)
        pcap_open_live cannot be used here */
     pcap_set_snaplen(g_ph, 65535);
     pcap_set_promisc(g_ph, 1);
-    pcap_set_timeout(g_ph, 50);          /* so dispatch returns when idle */
+    pcap_set_timeout(g_ph, 50);
     pcap_set_buffer_size(g_ph, 256 * 1024 * 1024);
 
     if (pcap_activate(g_ph) < 0) {
@@ -402,9 +483,7 @@ int main(int argc, char **argv)
     signal(SIGINT,  on_sigint);
     signal(SIGTERM, on_sigint);
 
-    /* one buffered write per redraw instead of hundreds of small ones */
     setvbuf(stdout, NULL, _IOFBF, 1 << 20);
-
     g_last_print = time(NULL);
 
     /* the display is driven by the clock, not by packet arrival, so a
