@@ -1,28 +1,31 @@
 /* -------------------------------------------------------------------------
- * Split 8 fronthaul scope - ImGui / ImPlot
+ * Split 8 fronthaul scope
  *
- * The GUI twin of "live3 -g": one 10 ms radio frame drawn across the window,
- * both directions, at the resolution the fronthaul actually carries - one
- * point per eCPRI packet, 1920 samples, 15.625 us, 640 points per frame.
+ * Draws what a digital oscilloscope draws: a min/max envelope of the raw
+ * waveform, in linear amplitude, about a true zero baseline. For each
+ * eCPRI packet (1920 samples) the smallest and largest I sample are kept
+ * and the band between them is filled - the same decimation a scope does
+ * per pixel column.
  *
- * Two stacked plots share the slot axis. Each has its own Y axis because the
- * uplink runs 30-40 dB below the downlink and a shared scale would flatten
- * it. Vertical lines mark the twenty slot boundaries.
+ * Two stacked plots share the slot axis; each direction has its own Y
+ * axis, auto-ranged, because the uplink is 30-40 dB below the downlink.
  *
- * Capture runs on its own thread and the render thread only reads. At
- * 128,000 packets per second the capture path must never wait on the
- * renderer - the drop counter at the top is the check.
+ * Run:  ./build/src/imgui_app <iface> <dl-src-mac>
+ *       sudo setcap "cap_net_raw,cap_net_admin=eip" ./build/src/imgui_app
+ *       (repeat setcap after every rebuild; do NOT run with sudo)
  *
- *   drop=0            the picture is trustworthy
- *   drop non-zero     it is not, and it says so in red
+ * Fixes in this revision
  *
- * Build, inside the imgui_mini skeleton:
- *   bash build.sh
- *   sudo setcap "cap_net_raw,cap_net_admin=eip" ./build/src/imgui_app
- *   ./build/src/imgui_app sfp1 bc:24:11:ec:73:d3
+ *   1. "clear" cleared only one of the two lanes. The flag was consumed
+ *      with exchange(false), so whichever direction's finish_frame ran
+ *      first took it and the other never saw it. Which one won was a race.
+ *      There are now two flags, one per direction.
  *
- * Do not run it with sudo - sudo discards the X authority cookie and the
- * window cannot open. setcap once after every rebuild instead.
+ *   2. The Y range was computed from the persistence arrays alone, so
+ *      clearing persistence collapsed the scale to its 1e-6 seed and the
+ *      live trace - four orders of magnitude larger - fell outside the
+ *      axis and vanished. The scale now follows whatever is actually
+ *      drawn, and has a floor so it can never collapse.
  * ---------------------------------------------------------------------- */
 
 #include <iostream>
@@ -45,144 +48,90 @@
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_opengl3.h"
 
-#define ETH_HDR            14
-#define ECPRI_HDR_SIZE      8
-#define SAMPLES_PER_PKT  1920
-#define PKTS_PER_SLOT      32
+#define ECPRI_HDR_SIZE    8
+#define SAMPLES_PER_PKT   1920
+#define PKTS_PER_SLOT     32
+#define SLOTS_PER_FRAME   20
 #define PKTS_PER_FRAME    640
-#define SLOTS_PER_FRAME    20
-#define IQ_BYTES         7680
-#define FULL_SCALE       32767.0
-#define SILENT_DB        (-120.0)
-#define QUIET_DB         (-110.0)
-#define US_PER_PKT       15.625
-#define WRAP_MIN         (PKTS_PER_FRAME / 2)
+#define FULL_SCALE        32768.0
 
-/* This testbed: 5 ms pattern, 7 DL slots, 1 mixed, 2 UL, twice per frame.
-   Slots 0-6 and 10-16 can never carry uplink. */
-static inline bool is_dl_only(int slot) { return (slot % 10) <= 6; }
+/* live envelope, normalised to +/-1 full scale */
+static float g_dl_lo[PKTS_PER_FRAME], g_dl_hi[PKTS_PER_FRAME];
+static float g_ul_lo[PKTS_PER_FRAME], g_ul_hi[PKTS_PER_FRAME];
 
-/* ---- shared between the two threads ----------------------------------- */
+/* persistence: widest envelope seen since the last clear */
+static float g_dl_plo[PKTS_PER_FRAME], g_dl_phi[PKTS_PER_FRAME];
+static float g_ul_plo[PKTS_PER_FRAME], g_ul_phi[PKTS_PER_FRAME];
 
-static float g_cur_dl[PKTS_PER_FRAME], g_cur_ul[PKTS_PER_FRAME];
-static float g_pk_dl [PKTS_PER_FRAME], g_pk_ul [PKTS_PER_FRAME];
-
-static std::atomic<uint64_t> g_pkts_dl(0), g_pkts_ul(0);
 static std::atomic<uint32_t> g_cells_dl(0), g_cells_ul(0);
-static std::atomic<uint64_t> g_partial_dl(0), g_partial_ul(0);
 static std::atomic<uint32_t> g_drop(0), g_ifdrop(0);
-static std::atomic<uint64_t> g_bad(0), g_trunc(0), g_reorder(0);
+static std::atomic<uint64_t> g_bad(0), g_trunc(0);
 static std::atomic<bool>     g_running(true);
-static std::atomic<bool>     g_clear_peak(false);
 
-static std::atomic<double>   g_skew_us(0.0);
-static std::atomic<double>   g_late_dl(0.0), g_late_ul(0.0);
-
-static std::atomic<uint64_t> g_viol_n(0), g_viol_frame(0);
-static std::atomic<int>      g_viol_slot(-1);
-static std::atomic<double>   g_viol_db(0.0);
+/* one flag per direction: a single shared flag was consumed by whichever
+   finish_frame ran first, so only one lane ever cleared */
+static std::atomic<bool>     g_reset_dl(false), g_reset_ul(false);
 
 static pcap_t      *g_ph = NULL;
-static unsigned char g_gnb[6];
+static unsigned char g_dl_mac[6];
 
-/* display options, touched only by the render thread */
-static bool g_show_peak = true;
-static bool g_autoscale = true;
-
-/* ---- per-direction state ---------------------------------------------- */
+static bool g_persist = true;
+static bool g_autofit = true;
 
 typedef struct {
-    char      tag;                       /* 'D' or 'U' */
-    uint64_t  acc[PKTS_PER_FRAME];
-    uint64_t  nsamp[PKTS_PER_FRAME];
-    uint8_t   seen[PKTS_PER_FRAME];
-    uint32_t  last_cell;
-    int       started;
-    uint64_t  fno;
-    struct timeval t0;
-    int       t0_valid;
-    double    late_max;
+    int16_t  mn[PKTS_PER_FRAME];
+    int16_t  mx[PKTS_PER_FRAME];
+    uint8_t  seen[PKTS_PER_FRAME];
+    uint32_t last_cell;
+    int      started;
+    int      is_dl;
 } dir_t;
 
 static dir_t g_dl, g_ul;
 
-static double to_db(uint64_t acc, uint64_t n)
-{
-    if (n == 0 || acc == 0) return SILENT_DB;
-    double db = 10.0 * log10(((double)acc / (double)n)
-                             / (FULL_SCALE * FULL_SCALE));
-    return db < SILENT_DB ? SILENT_DB : db;
-}
-
-static double us_between(const struct timeval *a, const struct timeval *b)
-{
-    return (double)(b->tv_sec - a->tv_sec) * 1e6
-         + (double)(b->tv_usec - a->tv_usec);
-}
-
 static void finish_frame(dir_t *d)
 {
-    bool   is_dl = (d->tag == 'D');
-    float *cur   = is_dl ? g_cur_dl : g_cur_ul;
-    float *pk    = is_dl ? g_pk_dl  : g_pk_ul;
+    float *lo  = d->is_dl ? g_dl_lo  : g_ul_lo;
+    float *hi  = d->is_dl ? g_dl_hi  : g_ul_hi;
+    float *plo = d->is_dl ? g_dl_plo : g_ul_plo;
+    float *phi = d->is_dl ? g_dl_phi : g_ul_phi;
 
-    bool clear = g_clear_peak.exchange(false);
+    bool clear = (d->is_dl ? g_reset_dl : g_reset_ul).exchange(false);
 
     uint32_t have = 0;
-    for (uint32_t c = 0; c < PKTS_PER_FRAME; c++) have += d->seen[c];
+    for (uint32_t c = 0; c < PKTS_PER_FRAME; c++) {
+        have += d->seen[c];
 
-    for (uint32_t s = 0; s < SLOTS_PER_FRAME; s++) {
-        uint64_t sacc = 0, sn = 0;
+        float a = (float)(d->mn[c] / FULL_SCALE);
+        float b = (float)(d->mx[c] / FULL_SCALE);
+        lo[c] = a;
+        hi[c] = b;
 
-        for (uint32_t k = 0; k < PKTS_PER_SLOT; k++) {
-            uint32_t c = s * PKTS_PER_SLOT + k;
-            sacc += d->acc[c];
-            sn   += d->nsamp[c];
-
-            float db = (float)to_db(d->acc[c], d->nsamp[c]);
-            cur[c] = db;
-            if (clear || db > pk[c]) pk[c] = db;
-
-            d->acc[c]   = 0;
-            d->nsamp[c] = 0;
+        if (clear) { plo[c] = a; phi[c] = b; }
+        else {
+            if (a < plo[c]) plo[c] = a;
+            if (b > phi[c]) phi[c] = b;
         }
 
-        /* uplink energy where the TDD pattern forbids it */
-        if (!is_dl && is_dl_only((int)s)) {
-            double sdb = to_db(sacc, sn);
-            if (sdb > QUIET_DB) {
-                g_viol_n++;
-                g_viol_frame.store(d->fno);
-                g_viol_slot.store((int)s);
-                g_viol_db.store(sdb);
-                fprintf(stderr, "TDD VIOLATION  frame %llu  uplink in DL slot"
-                                " %u  %.1f dBFS\n",
-                        (unsigned long long)d->fno, s, sdb);
-            }
-        }
+        d->mn[c] = 0;
+        d->mx[c] = 0;
     }
 
-    if (is_dl) {
-        g_cells_dl.store(have);
-        if (have < PKTS_PER_FRAME) g_partial_dl++;
-    } else {
-        g_cells_ul.store(have);
-        if (have < PKTS_PER_FRAME) g_partial_ul++;
-    }
-
-    d->fno++;
     memset(d->seen, 0, sizeof d->seen);
+
+    if (d->is_dl) g_cells_dl.store(have);
+    else          g_cells_ul.store(have);
 }
 
-/* hot path: each sample touched once, straight out of the capture buffer */
+/* hot path: one pass over the samples, integer compares only */
 static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
                       const unsigned char *bytes)
 {
     (void)user;
 
-    if (h->caplen < ETH_HDR + ECPRI_HDR_SIZE) { g_bad++; return; }
+    if (h->caplen < 14 + ECPRI_HDR_SIZE + SAMPLES_PER_PKT * 4) { g_trunc++; return; }
 
-    const unsigned char *b = bytes + ETH_HDR;
+    const unsigned char *b = bytes + 14;
     if (((b[0] >> 4) & 0x0F) != 1 || b[1] != 0x00) { g_bad++; return; }
 
     uint16_t v;
@@ -190,53 +139,27 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
     uint16_t seq = ntohs(v);
     if (seq < 1 || seq > PKTS_PER_FRAME) { g_bad++; return; }
 
-    /* direction is the source MAC and nothing else - decided before the
-       slot number is even computed */
-    bool is_dl = (memcmp(bytes + 6, g_gnb, 6) == 0);
-    dir_t *d   = is_dl ? &g_dl : &g_ul;
-
     uint32_t cell = (uint32_t)seq - 1;
 
-    if (d->started && cell < d->last_cell) {
-        if (d->last_cell - cell > WRAP_MIN) finish_frame(d);
-        else                                g_reorder++;
-    }
+    int is_dl = (memcmp(bytes + 6, g_dl_mac, 6) == 0);
+    dir_t *d  = is_dl ? &g_dl : &g_ul;
+
+    if (d->started && cell < d->last_cell) finish_frame(d);
     d->started   = 1;
     d->last_cell = cell;
-    d->seen[cell] = 1;
-    if (is_dl) g_pkts_dl++; else g_pkts_ul++;
-
-    /* arrival time against claimed position */
-    if (cell == 0) {
-        d->t0 = h->ts;
-        d->t0_valid = 1;
-        if (g_dl.t0_valid && g_ul.t0_valid) {
-            double sk = us_between(&g_dl.t0, &g_ul.t0);
-            while (sk >  5000.0) sk -= 10000.0;
-            while (sk < -5000.0) sk += 10000.0;
-            g_skew_us.store(sk);
-        }
-    } else if (d->t0_valid) {
-        double err = us_between(&d->t0, &h->ts) - (double)cell * US_PER_PKT;
-        if (fabs(err) > fabs(d->late_max)) {
-            d->late_max = err;
-            (is_dl ? g_late_dl : g_late_ul).store(err);
-        }
-    }
-
-    if (h->caplen < ETH_HDR + ECPRI_HDR_SIZE + IQ_BYTES) { g_trunc++; return; }
 
     const int16_t *iq = (const int16_t *)(b + ECPRI_HDR_SIZE);
-    uint64_t acc = 0, n = 0;
+
+    int16_t mn = 0, mx = 0;
     for (int i = 0; i < SAMPLES_PER_PKT; i++) {
-        int64_t I = iq[2 * i];
-        int64_t Q = iq[2 * i + 1];
-        acc += (uint64_t)(I * I) + (uint64_t)(Q * Q);
-        n   += 2;
+        int16_t I = iq[2 * i];
+        if (I < mn) mn = I;
+        if (I > mx) mx = I;
     }
 
-    d->acc[cell]   += acc;
-    d->nsamp[cell] += n;
+    d->mn[cell] = mn;
+    d->mx[cell] = mx;
+    d->seen[cell] = 1;
 }
 
 static void stats_thread()
@@ -251,99 +174,34 @@ static void stats_thread()
             pd = st.ps_drop;
             pi = st.ps_ifdrop;
         }
-        g_dl.late_max = 0.0;
-        g_ul.late_max = 0.0;
     }
 }
 
-static void capture_thread(const char *iface, unsigned ethertype)
+static void capture_thread(const char *iface)
 {
     char err[PCAP_ERRBUF_SIZE] = {0};
 
     g_ph = pcap_create(iface, err);
     if (!g_ph) { std::cerr << "pcap_create: " << err << "\n"; return; }
 
-    /* buffer size must be set BEFORE activation */
-    pcap_set_snaplen(g_ph, 65535);
+    pcap_set_snaplen(g_ph, 9000);
     pcap_set_promisc(g_ph, 1);
-    pcap_set_timeout(g_ph, 50);
+    pcap_set_timeout(g_ph, 10);
     pcap_set_buffer_size(g_ph, 256 * 1024 * 1024);
 
     if (pcap_activate(g_ph) < 0) {
         std::cerr << "pcap_activate: " << pcap_geterr(g_ph) << "\n";
-        std::cerr << "  setcap \"cap_net_raw,cap_net_admin=eip\" on the binary\n";
         return;
     }
 
-    char filter[64];
     struct bpf_program fp;
-    snprintf(filter, sizeof filter, "ether proto 0x%04x", ethertype);
-
-    /* the filter runs inside the kernel: non-matching frames are discarded
-       before they are ever copied to this process */
-    if (pcap_compile(g_ph, &fp, filter, 1, PCAP_NETMASK_UNKNOWN) == 0) {
+    if (pcap_compile(g_ph, &fp, "ether proto 0xaefe", 1,
+                     PCAP_NETMASK_UNKNOWN) == 0) {
         pcap_setfilter(g_ph, &fp);
         pcap_freecode(&fp);
     }
 
-    while (g_running.load()) {
-        int n = pcap_dispatch(g_ph, -1, on_packet, NULL);
-        if (n == -1 || n == -2) break;
-    }
-}
-
-/* ---- drawing ---------------------------------------------------------- */
-
-static double g_xs[PKTS_PER_FRAME];          /* x in slot units, 0..20 */
-static double g_grid[SLOTS_PER_FRAME + 1];
-static double g_y[PKTS_PER_FRAME], g_p[PKTS_PER_FRAME];
-
-static double      g_tick_pos[SLOTS_PER_FRAME];
-static char        g_tick_buf[SLOTS_PER_FRAME][4];
-static const char *g_tick_lbl[SLOTS_PER_FRAME];
-
-static void draw_trace(const char *title, const float *cur, const float *pk,
-                       ImVec4 col, bool show_x)
-{
-    double top = SILENT_DB;
-    for (int c = 0; c < PKTS_PER_FRAME; c++) {
-        g_y[c] = cur[c];
-        g_p[c] = pk[c];
-        if (g_p[c] > top) top = g_p[c];
-    }
-
-    if (top <= QUIET_DB) top = -20.0;
-    top = ceil(top / 5.0) * 5.0;
-    double bot = g_autoscale ? top - 40.0 : SILENT_DB;
-    if (!g_autoscale) top = 0.0;
-
-    ImPlotAxisFlags xf = ImPlotAxisFlags_Lock;
-    if (!show_x) xf |= ImPlotAxisFlags_NoTickLabels;
-
-    if (ImPlot::BeginPlot(title, ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
-        ImPlot::SetupAxes(show_x ? "slot" : NULL, "dBFS",
-                          xf, ImPlotAxisFlags_Lock);
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0, SLOTS_PER_FRAME, ImPlotCond_Always);
-        ImPlot::SetupAxisLimits(ImAxis_Y1, bot, top, ImPlotCond_Always);
-        ImPlot::SetupAxisTicks(ImAxis_X1, g_tick_pos, SLOTS_PER_FRAME, g_tick_lbl);
-
-        /* slot boundaries */
-        ImPlot::SetNextLineStyle(ImVec4(0.45f, 0.45f, 0.45f, 0.30f), 1.0f);
-        ImPlot::PlotInfLines("##grid", g_grid, SLOTS_PER_FRAME + 1);
-
-        if (g_show_peak) {
-            ImPlot::SetNextLineStyle(ImVec4(col.x, col.y, col.z, 0.40f), 1.0f);
-            ImPlot::PlotLine("##peak", g_xs, g_p, PKTS_PER_FRAME);
-        }
-
-        ImPlot::SetNextFillStyle(col, 0.25f);
-        ImPlot::PlotShaded("##fill", g_xs, g_y, PKTS_PER_FRAME, bot);
-
-        ImPlot::SetNextLineStyle(col, 1.8f);
-        ImPlot::PlotLine("##trace", g_xs, g_y, PKTS_PER_FRAME);
-
-        ImPlot::EndPlot();
-    }
+    pcap_loop(g_ph, -1, on_packet, NULL);
 }
 
 static void glfwErrorCallback(int e, const char *d)
@@ -351,11 +209,80 @@ static void glfwErrorCallback(int e, const char *d)
     std::cerr << "GLFW error " << e << ": " << d << '\n';
 }
 
+static double g_xs[PKTS_PER_FRAME];
+static double g_grid[SLOTS_PER_FRAME + 1];
+static double g_lo[PKTS_PER_FRAME], g_hi[PKTS_PER_FRAME];
+static double g_plo[PKTS_PER_FRAME], g_phi[PKTS_PER_FRAME];
+static double g_mid[PKTS_PER_FRAME];
+
+static double      g_tick_pos[SLOTS_PER_FRAME];
+static char        g_tick_buf[SLOTS_PER_FRAME][4];
+static const char *g_tick_lbl[SLOTS_PER_FRAME];
+
+static void draw_trace(const char *title,
+                       const float *lo,  const float *hi,
+                       const float *plo, const float *phi,
+                       ImVec4 col, bool show_x)
+{
+    double span = 1e-6;
+    for (int c = 0; c < PKTS_PER_FRAME; c++) {
+        g_lo[c]  = lo[c];   g_hi[c]  = hi[c];
+        g_plo[c] = plo[c];  g_phi[c] = phi[c];
+
+        /* the scale must follow what is actually drawn. Deriving it from
+           the persistence arrays alone meant that clearing them collapsed
+           the axis to the 1e-6 seed and the live trace fell outside it. */
+        if (fabs(g_hi[c]) > span) span = fabs(g_hi[c]);
+        if (fabs(g_lo[c]) > span) span = fabs(g_lo[c]);
+        if (g_persist) {
+            if (fabs(g_phi[c]) > span) span = fabs(g_phi[c]);
+            if (fabs(g_plo[c]) > span) span = fabs(g_plo[c]);
+        }
+    }
+    if (span < 1e-4) span = 1e-4;        /* floor, so it can never collapse */
+    span *= 1.15;
+
+    ImPlotAxisFlags xf = ImPlotAxisFlags_Lock;
+    if (!show_x) xf |= ImPlotAxisFlags_NoTickLabels;
+
+    if (ImPlot::BeginPlot(title, ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
+        ImPlot::SetupAxes(show_x ? "slot" : NULL, "amplitude", xf, ImPlotAxisFlags_Lock);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0, SLOTS_PER_FRAME, ImPlotCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_Y1,
+                                g_autofit ? -span : -1.0,
+                                g_autofit ?  span :  1.0,
+                                ImPlotCond_Always);
+        ImPlot::SetupAxisTicks(ImAxis_X1, g_tick_pos, SLOTS_PER_FRAME, g_tick_lbl);
+
+        /* slot boundaries */
+        ImPlot::SetNextLineStyle(ImVec4(0.45f, 0.45f, 0.45f, 0.30f), 1.0f);
+        ImPlot::PlotInfLines("##grid", g_grid, SLOTS_PER_FRAME + 1);
+
+        /* persistence band, like a scope's afterglow */
+        if (g_persist) {
+            ImPlot::SetNextFillStyle(col, 0.20f);
+            ImPlot::PlotShaded("##persist", g_xs, g_plo, g_phi, PKTS_PER_FRAME);
+        }
+
+        /* live envelope */
+        ImPlot::SetNextFillStyle(col, 1.0f);
+        ImPlot::PlotShaded("##env", g_xs, g_lo, g_hi, PKTS_PER_FRAME);
+
+        /* centre line, so the trace stays continuous through silent slots
+         * where min and max are both zero and the band has no height */
+        for (int c = 0; c < PKTS_PER_FRAME; c++)
+            g_mid[c] = 0.5 * (g_lo[c] + g_hi[c]);
+        ImPlot::SetNextLineStyle(col, 1.6f);
+        ImPlot::PlotLine("##mid", g_xs, g_mid, PKTS_PER_FRAME);
+
+        ImPlot::EndPlot();
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
-        std::cerr << "usage: " << argv[0] << " <iface> <gnb-mac> [ethertype]\n"
-                  << "  e.g. " << argv[0] << " sfp1 bc:24:11:ec:73:d3\n";
+        std::cerr << "usage: " << argv[0] << " <iface> <dl-src-mac>\n";
         return 1;
     }
 
@@ -365,20 +292,16 @@ int main(int argc, char **argv)
         std::cerr << "bad MAC: " << argv[2] << "\n";
         return 1;
     }
-    for (int i = 0; i < 6; i++) g_gnb[i] = (unsigned char)m[i];
-
-    unsigned ethertype = (argc > 3) ? (unsigned)strtoul(argv[3], NULL, 0)
-                                    : 0xaefe;
+    for (int i = 0; i < 6; i++) g_dl_mac[i] = (unsigned char)m[i];
 
     memset(&g_dl, 0, sizeof g_dl);
     memset(&g_ul, 0, sizeof g_ul);
-    g_dl.tag = 'D';
-    g_ul.tag = 'U';
+    g_dl.is_dl = 1;
 
     for (int c = 0; c < PKTS_PER_FRAME; c++) {
-        g_cur_dl[c] = g_cur_ul[c] = (float)SILENT_DB;
-        g_pk_dl[c]  = g_pk_ul[c]  = (float)SILENT_DB;
-        g_xs[c] = (double)c / (double)PKTS_PER_SLOT;    /* slot units */
+        g_dl_lo[c] = g_dl_hi[c] = g_ul_lo[c] = g_ul_hi[c] = 0.0f;
+        g_dl_plo[c] = g_dl_phi[c] = g_ul_plo[c] = g_ul_phi[c] = 0.0f;
+        g_xs[c] = (double)c / (double)PKTS_PER_SLOT;   /* x in slot units */
     }
     for (int s = 0; s <= SLOTS_PER_FRAME; s++) g_grid[s] = s;
     for (int s = 0; s < SLOTS_PER_FRAME; s++) {
@@ -394,11 +317,8 @@ int main(int argc, char **argv)
     GLFWwindow *window = glfwCreateWindow(1400, 820,
                                           "Split 8 fronthaul scope",
                                           nullptr, nullptr);
-    if (!window) {
-        std::cerr << "no window - is DISPLAY set?\n";
-        glfwTerminate();
-        return 1;
-    }
+    if (!window) { std::cerr << "no window - is DISPLAY set?\n"; glfwTerminate(); return 1; }
+
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
@@ -410,18 +330,16 @@ int main(int argc, char **argv)
     ImGui::StyleColorsDark();
 
     ImGuiIO &io = ImGui::GetIO();
-    io.FontGlobalScale = 1.2f;
+    io.FontGlobalScale = 1.25f;
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 
-    std::thread cap(capture_thread, argv[1], ethertype);
+    std::thread cap(capture_thread, argv[1]);
     std::thread sta(stats_thread);
 
-    const ImVec4 COL_DL(1.00f, 0.72f, 0.15f, 1.0f);
-    const ImVec4 COL_UL(0.35f, 0.85f, 0.35f, 1.0f);
-    const ImVec4 COL_OK(0.30f, 1.00f, 0.30f, 1.0f);
-    const ImVec4 COL_BAD(1.00f, 0.25f, 0.25f, 1.0f);
+    const ImVec4 COL_DL(1.00f, 0.85f, 0.10f, 1.0f);   /* scope yellow */
+    const ImVec4 COL_UL(0.20f, 0.95f, 0.35f, 1.0f);   /* scope green  */
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -439,53 +357,28 @@ int main(int argc, char **argv)
 
         uint32_t drop = g_drop.load(), ifdrop = g_ifdrop.load();
 
-        ImGui::Text("%s   DL src %s   |   DL %llu pkts  %u/640 cells  partial %llu"
-                    "   |   UL %llu pkts  %u/640 cells  partial %llu",
-                    argv[1], argv[2],
-                    (unsigned long long)g_pkts_dl.load(), g_cells_dl.load(),
-                    (unsigned long long)g_partial_dl.load(),
-                    (unsigned long long)g_pkts_ul.load(), g_cells_ul.load(),
-                    (unsigned long long)g_partial_ul.load());
+        ImGui::Text("%s   DL src %s   |   %u/640 cells DL   %u/640 cells UL",
+                    argv[1], argv[2], g_cells_dl.load(), g_cells_ul.load());
 
         if (drop || ifdrop)
-            ImGui::TextColored(COL_BAD,
-                "drop=+%u ifdrop=+%u  bad=%llu trunc=%llu reorder=%llu"
-                "   << LOSSY, the trace has holes",
-                drop, ifdrop, (unsigned long long)g_bad.load(),
-                (unsigned long long)g_trunc.load(),
-                (unsigned long long)g_reorder.load());
+            ImGui::TextColored(ImVec4(1, 0.25f, 0.25f, 1),
+                               "LOSSY  drop=+%u ifdrop=+%u   -- trace has holes",
+                               drop, ifdrop);
         else
-            ImGui::TextColored(COL_OK,
-                "drop=0 ifdrop=0  bad=%llu trunc=%llu reorder=%llu   clean",
-                (unsigned long long)g_bad.load(),
-                (unsigned long long)g_trunc.load(),
-                (unsigned long long)g_reorder.load());
+            ImGui::TextColored(ImVec4(0.3f, 1, 0.3f, 1), "clean  drop=0 ifdrop=0");
 
-        ImGui::Text("timing:  DL worst %+8.1f us   UL worst %+8.1f us"
-                    "   UL-DL frame skew %+8.1f us   |   %.0f FPS",
-                    g_late_dl.load(), g_late_ul.load(), g_skew_us.load(),
-                    io.Framerate);
-
-        if (g_viol_n.load())
-            ImGui::TextColored(COL_BAD,
-                "!! %llu TDD violations - uplink in a downlink slot."
-                "  last: frame %llu  slot %d  %.1f dBFS",
-                (unsigned long long)g_viol_n.load(),
-                (unsigned long long)g_viol_frame.load(),
-                g_viol_slot.load(), g_viol_db.load());
-
-        ImGui::Checkbox("peak hold", &g_show_peak);
+        ImGui::Checkbox("persistence", &g_persist);
         ImGui::SameLine();
-        if (ImGui::Button("clear")) g_clear_peak.store(true);
+        if (ImGui::Button("clear")) { g_reset_dl.store(true); g_reset_ul.store(true); }
         ImGui::SameLine();
-        ImGui::Checkbox("auto range each channel", &g_autoscale);
-        ImGui::SameLine();
-        ImGui::TextDisabled("(640 points per frame, 15.625 us each)");
+        ImGui::Checkbox("auto range each channel", &g_autofit);
 
         if (ImPlot::BeginSubplots("##stack", 2, 1, ImVec2(-1, -1),
                                   ImPlotSubplotFlags_LinkCols)) {
-            draw_trace("DL   gNB -> UE", g_cur_dl, g_pk_dl, COL_DL, false);
-            draw_trace("UL   UE -> gNB", g_cur_ul, g_pk_ul, COL_UL, true);
+            draw_trace("DL   gNB -> UE", g_dl_lo, g_dl_hi, g_dl_plo, g_dl_phi,
+                       COL_DL, false);
+            draw_trace("UL   UE -> gNB", g_ul_lo, g_ul_hi, g_ul_plo, g_ul_phi,
+                       COL_UL, true);
             ImPlot::EndSubplots();
         }
 
@@ -495,7 +388,7 @@ int main(int argc, char **argv)
         int w, h;
         glfwGetFramebufferSize(window, &w, &h);
         glViewport(0, 0, w, h);
-        glClearColor(0.06f, 0.07f, 0.09f, 1.00f);
+        glClearColor(0.04f, 0.05f, 0.06f, 1.00f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
