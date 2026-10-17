@@ -55,6 +55,12 @@
 #define PKTS_PER_FRAME    640
 #define FULL_SCALE        32768.0
 
+/* A real frame wrap goes 639 -> 0.  A reordering of two packets goes 7 -> 6,
+   which is also a backward step - treating that as a wrap cuts the frame
+   after a couple of packets and collapses the cell count. Only a large
+   backward jump is a wrap. */
+#define WRAP_MIN          (PKTS_PER_FRAME / 2)
+
 /* live envelope, normalised to +/-1 full scale */
 static float g_dl_lo[PKTS_PER_FRAME], g_dl_hi[PKTS_PER_FRAME];
 static float g_ul_lo[PKTS_PER_FRAME], g_ul_hi[PKTS_PER_FRAME];
@@ -144,7 +150,10 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
     int is_dl = (memcmp(bytes + 6, g_dl_mac, 6) == 0);
     dir_t *d  = is_dl ? &g_dl : &g_ul;
 
-    if (d->started && cell < d->last_cell) finish_frame(d);
+    /* only a large backward jump is a frame wrap; a small one is a
+       reordering and must not split the frame in two */
+    if (d->started && cell < d->last_cell &&
+        d->last_cell - cell > WRAP_MIN) finish_frame(d);
     d->started   = 1;
     d->last_cell = cell;
 
