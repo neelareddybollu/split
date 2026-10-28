@@ -14,18 +14,56 @@
  *       sudo setcap "cap_net_raw,cap_net_admin=eip" ./build/src/imgui_app
  *       (repeat setcap after every rebuild; do NOT run with sudo)
  *
- * Fixes in this revision
+ * ---------------------------------------------------------------------
+ * CHANGES IN THIS REVISION - all six came out of one screenshot where the
+ * terminal tool read "UL 0 pkts, all slots -120 dBFS" while this one drew
+ * a full-height band and claimed 640/640 cells UL.
  *
- *   1. "clear" cleared only one of the two lanes. The flag was consumed
- *      with exchange(false), so whichever direction's finish_frame ran
- *      first took it and the other never saw it. Which one won was a race.
- *      There are now two flags, one per direction.
+ *   1. PERSISTENCE WAS A HIGH-WATER MARK, NOT A PHOSPHOR.
+ *      "if (b > phi[c]) phi[c] = b" only ever rises. One transient - a
+ *      glitched frame, a reordering, a clipped packet - widened the band
+ *      permanently, and since the Y axis is derived from the band, that
+ *      single spike rescaled the axis for the rest of the session and
+ *      flattened the live trace. It now rises instantly and decays with a
+ *      time constant you can set, which is what a real phosphor does.
+ *      afterglow = 0 restores the old infinite hold.
  *
- *   2. The Y range was computed from the persistence arrays alone, so
- *      clearing persistence collapsed the scale to its 1e-6 seed and the
- *      live trace - four orders of magnitude larger - fell outside the
- *      axis and vanished. The scale now follows whatever is actually
- *      drawn, and has a floor so it can never collapse.
+ *   2. THE ENVELOPE ARRAYS WERE SHARED ACROSS THREADS WITH NO LOCK.
+ *      finish_frame (capture thread) wrote the same plain float arrays
+ *      draw_trace (render thread) was reading, so the renderer could copy
+ *      the first half of one frame and the second half of the next and
+ *      show a vertical discontinuity at random. Each completed frame is
+ *      now published under a mutex. The lock is held for about 5 us at
+ *      100 frames/s - 0.05% duty on the capture thread.
+ *
+ *   3. THE Y AXIS COULD JUMP FRAME TO FRAME.
+ *      It rises immediately, so a real signal is never clipped, but falls
+ *      with a slew limit, so it cannot flap.
+ *
+ *   4. bad AND trunc WERE COUNTED AND NEVER SHOWN.
+ *      A sender numbering its packets 0..639 instead of 1..640 would have
+ *      every seq_id 0 silently discarded and the whole axis offset by one
+ *      cell, with nothing on screen to say so.
+ *
+ *   5. A SILENT LANE KEPT SHOWING ITS LAST FRAME FOR EVER.
+ *      The envelope is only written in finish_frame, so when a direction
+ *      goes quiet the last completed frame stays on screen and the cell
+ *      count keeps reporting 640/640 from whenever that was. Each lane now
+ *      carries the age of its last completed frame; past 500 ms it is
+ *      drawn dimmed and labelled stale instead of claiming to be live.
+ *
+ *   6. OPTIONAL DC MEASUREMENT.
+ *      A constant added to I or Q does not average away, so it reads as
+ *      the same power in every slot whether or not anything is being
+ *      transmitted - which is what "every uplink slot at -30.9 dBFS"
+ *      looks like. Noise and tones both have zero mean; a DC offset does
+ *      not. The mean of I and Q over the frame separates them. Off by
+ *      default because it adds two accumulations per sample to the hot
+ *      loop; turn it on and watch that drop stays at 0.
+ *
+ *   7. "clear" cleared only one of the two lanes (kept from before). The
+ *      flag was consumed with exchange(false), so whichever direction's
+ *      finish_frame ran first took it. Two flags now, one per direction.
  * ---------------------------------------------------------------------- */
 
 #include <iostream>
@@ -33,7 +71,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <cstdint>
 #include <thread>
+#include <mutex>
 #include <chrono>
 #include <atomic>
 
@@ -55,78 +95,134 @@
 #define PKTS_PER_FRAME    640
 #define FULL_SCALE        32768.0
 
+/* radio frames arrive at 100/s; turns an afterglow in seconds into a
+   per-frame decay coefficient */
+#define FRAMES_PER_SEC    100.0f
+
+/* a lane with no completed frame for this long is not live any more */
+#define STALE_US          500000ULL
+
 /* A real frame wrap goes 639 -> 0.  A reordering of two packets goes 7 -> 6,
    which is also a backward step - treating that as a wrap cuts the frame
    after a couple of packets and collapses the cell count. Only a large
    backward jump is a wrap. */
 #define WRAP_MIN          (PKTS_PER_FRAME / 2)
 
-/* live envelope, normalised to +/-1 full scale */
-static float g_dl_lo[PKTS_PER_FRAME], g_dl_hi[PKTS_PER_FRAME];
-static float g_ul_lo[PKTS_PER_FRAME], g_ul_hi[PKTS_PER_FRAME];
+static uint64_t now_us(void)
+{
+    using namespace std::chrono;
+    return (uint64_t)duration_cast<microseconds>(
+               steady_clock::now().time_since_epoch()).count();
+}
 
-/* persistence: widest envelope seen since the last clear */
-static float g_dl_plo[PKTS_PER_FRAME], g_dl_phi[PKTS_PER_FRAME];
-static float g_ul_plo[PKTS_PER_FRAME], g_ul_phi[PKTS_PER_FRAME];
+/* ------------------------------------------------------- shared with the UI
+   One of these per direction. Written by the capture thread in finish_frame,
+   read by the render thread in draw_trace, both under g_env_mtx. Nothing
+   else crosses the thread boundary except the atomics below. */
+typedef struct {
+    float lo[PKTS_PER_FRAME],  hi[PKTS_PER_FRAME];    /* live envelope */
+    float plo[PKTS_PER_FRAME], phi[PKTS_PER_FRAME];   /* persistence   */
+    float dc_i, dc_q;                                 /* mean, in LSB  */
+} env_t;
 
-static std::atomic<uint32_t> g_cells_dl(0), g_cells_ul(0);
+static env_t      g_env[2];          /* [0] = UL, [1] = DL */
+static std::mutex g_env_mtx[2];
+
+static std::atomic<uint32_t> g_cells[2];
+static std::atomic<uint64_t> g_last_us[2];           /* last completed frame */
+
 static std::atomic<uint32_t> g_drop(0), g_ifdrop(0);
 static std::atomic<uint64_t> g_bad(0), g_trunc(0);
 static std::atomic<bool>     g_running(true);
+static std::atomic<bool>     g_measure_dc(false);
 
 /* one flag per direction: a single shared flag was consumed by whichever
    finish_frame ran first, so only one lane ever cleared */
-static std::atomic<bool>     g_reset_dl(false), g_reset_ul(false);
+static std::atomic<bool>     g_reset[2];
 
 static pcap_t      *g_ph = NULL;
 static unsigned char g_dl_mac[6];
 
-static bool g_persist = true;
-static bool g_autofit = true;
+static bool  g_persist   = true;
+static bool  g_autofit   = true;
+static float g_afterglow = 3.0f;     /* seconds; 0 = hold for ever */
 
+/* ------------------------------------------------- capture-thread state only */
 typedef struct {
     int16_t  mn[PKTS_PER_FRAME];
     int16_t  mx[PKTS_PER_FRAME];
+    int32_t  si[PKTS_PER_FRAME];     /* sum of I over the packet */
+    int32_t  sq[PKTS_PER_FRAME];     /* sum of Q over the packet */
     uint8_t  seen[PKTS_PER_FRAME];
+
+    float    lo[PKTS_PER_FRAME],  hi[PKTS_PER_FRAME];
+    float    plo[PKTS_PER_FRAME], phi[PKTS_PER_FRAME];
+
     uint32_t last_cell;
     int      started;
-    int      is_dl;
+    int      idx;                    /* 1 = DL, 0 = UL */
 } dir_t;
 
 static dir_t g_dl, g_ul;
 
 static void finish_frame(dir_t *d)
 {
-    float *lo  = d->is_dl ? g_dl_lo  : g_ul_lo;
-    float *hi  = d->is_dl ? g_dl_hi  : g_ul_hi;
-    float *plo = d->is_dl ? g_dl_plo : g_ul_plo;
-    float *phi = d->is_dl ? g_dl_phi : g_ul_phi;
+    const int k_idx = d->idx;
+    bool clear = g_reset[k_idx].exchange(false);
 
-    bool clear = (d->is_dl ? g_reset_dl : g_reset_ul).exchange(false);
+    /* Phosphor, not a high-water mark. Rise instantly so nothing real is
+       missed; decay towards the live value so one transient fades instead
+       of pinning the band - and the axis - for the whole session. */
+    float k = 0.0f;
+    if (g_afterglow > 0.01f)
+        k = 1.0f - expf(-1.0f / (FRAMES_PER_SEC * g_afterglow));
 
     uint32_t have = 0;
+    int64_t  tot_i = 0, tot_q = 0;
+
     for (uint32_t c = 0; c < PKTS_PER_FRAME; c++) {
         have += d->seen[c];
 
-        float a = (float)(d->mn[c] / FULL_SCALE);
-        float b = (float)(d->mx[c] / FULL_SCALE);
-        lo[c] = a;
-        hi[c] = b;
+        float a = (float)d->mn[c] / (float)FULL_SCALE;
+        float b = (float)d->mx[c] / (float)FULL_SCALE;
 
-        if (clear) { plo[c] = a; phi[c] = b; }
-        else {
-            if (a < plo[c]) plo[c] = a;
-            if (b > phi[c]) phi[c] = b;
+        d->lo[c] = a;
+        d->hi[c] = b;
+
+        if (clear) {
+            d->plo[c] = a;
+            d->phi[c] = b;
+        } else {
+            d->phi[c] = (b > d->phi[c]) ? b : d->phi[c] + (b - d->phi[c]) * k;
+            d->plo[c] = (a < d->plo[c]) ? a : d->plo[c] + (a - d->plo[c]) * k;
         }
 
-        d->mn[c] = 0;
-        d->mx[c] = 0;
+        tot_i += d->si[c];
+        tot_q += d->sq[c];
+
+        d->mn[c] = 0;  d->mx[c] = 0;
+        d->si[c] = 0;  d->sq[c] = 0;
     }
 
     memset(d->seen, 0, sizeof d->seen);
 
-    if (d->is_dl) g_cells_dl.store(have);
-    else          g_cells_ul.store(have);
+    const double n = (double)PKTS_PER_FRAME * (double)SAMPLES_PER_PKT;
+
+    /* publish the whole frame at once: the renderer must never see half of
+       one frame and half of the next */
+    {
+        env_t *E = &g_env[k_idx];
+        std::lock_guard<std::mutex> lk(g_env_mtx[k_idx]);
+        memcpy(E->lo,  d->lo,  sizeof E->lo);
+        memcpy(E->hi,  d->hi,  sizeof E->hi);
+        memcpy(E->plo, d->plo, sizeof E->plo);
+        memcpy(E->phi, d->phi, sizeof E->phi);
+        E->dc_i = (float)((double)tot_i / n);
+        E->dc_q = (float)((double)tot_q / n);
+    }
+
+    g_cells[k_idx].store(have);
+    g_last_us[k_idx].store(now_us());
 }
 
 /* hot path: one pass over the samples, integer compares only */
@@ -160,14 +256,34 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
     const int16_t *iq = (const int16_t *)(b + ECPRI_HDR_SIZE);
 
     int16_t mn = 0, mx = 0;
-    for (int i = 0; i < SAMPLES_PER_PKT; i++) {
-        int16_t I = iq[2 * i];
-        if (I < mn) mn = I;
-        if (I > mx) mx = I;
+
+    if (g_measure_dc.load(std::memory_order_relaxed)) {
+        /* Q lives in the same cache line as I, so this costs arithmetic
+           rather than memory traffic. Max |sum| is 1920 * 32768, which
+           fits int32 with room to spare. */
+        int32_t si = 0, sq = 0;
+        for (int i = 0; i < SAMPLES_PER_PKT; i++) {
+            int16_t I = iq[2 * i];
+            int16_t Q = iq[2 * i + 1];
+            if (I < mn) mn = I;
+            if (I > mx) mx = I;
+            si += I;
+            sq += Q;
+        }
+        d->si[cell] = si;
+        d->sq[cell] = sq;
+    } else {
+        for (int i = 0; i < SAMPLES_PER_PKT; i++) {
+            int16_t I = iq[2 * i];
+            if (I < mn) mn = I;
+            if (I > mx) mx = I;
+        }
+        d->si[cell] = 0;
+        d->sq[cell] = 0;
     }
 
-    d->mn[cell] = mn;
-    d->mx[cell] = mx;
+    d->mn[cell]   = mn;
+    d->mx[cell]   = mx;
     d->seen[cell] = 1;
 }
 
@@ -224,32 +340,50 @@ static double g_lo[PKTS_PER_FRAME], g_hi[PKTS_PER_FRAME];
 static double g_plo[PKTS_PER_FRAME], g_phi[PKTS_PER_FRAME];
 static double g_mid[PKTS_PER_FRAME];
 
+/* one held span per lane, so the axis can rise at once but only fall slowly */
+static double g_span_hold[2] = { 1e-4, 1e-4 };
+
 static double      g_tick_pos[SLOTS_PER_FRAME];
 static char        g_tick_buf[SLOTS_PER_FRAME][4];
 static const char *g_tick_lbl[SLOTS_PER_FRAME];
 
-static void draw_trace(const char *title,
-                       const float *lo,  const float *hi,
-                       const float *plo, const float *phi,
-                       ImVec4 col, bool show_x)
+static void draw_trace(const char *title, int idx, ImVec4 col, bool show_x,
+                       bool stale)
 {
-    double span = 1e-6;
-    for (int c = 0; c < PKTS_PER_FRAME; c++) {
-        g_lo[c]  = lo[c];   g_hi[c]  = hi[c];
-        g_plo[c] = plo[c];  g_phi[c] = phi[c];
-
-        /* the scale must follow what is actually drawn. Deriving it from
-           the persistence arrays alone meant that clearing them collapsed
-           the axis to the 1e-6 seed and the live trace fell outside it. */
-        if (fabs(g_hi[c]) > span) span = fabs(g_hi[c]);
-        if (fabs(g_lo[c]) > span) span = fabs(g_lo[c]);
-        if (g_persist) {
-            if (fabs(g_phi[c]) > span) span = fabs(g_phi[c]);
-            if (fabs(g_plo[c]) > span) span = fabs(g_plo[c]);
+    /* take one consistent frame, then let go of the lock immediately */
+    {
+        std::lock_guard<std::mutex> lk(g_env_mtx[idx]);
+        const env_t *E = &g_env[idx];
+        for (int c = 0; c < PKTS_PER_FRAME; c++) {
+            g_lo[c]  = E->lo[c];   g_hi[c]  = E->hi[c];
+            g_plo[c] = E->plo[c];  g_phi[c] = E->phi[c];
         }
     }
-    if (span < 1e-4) span = 1e-4;        /* floor, so it can never collapse */
-    span *= 1.15;
+
+    /* a lane that has stopped sending is showing an old frame - dim it so
+       it cannot be mistaken for something live */
+    if (stale) { col.x *= 0.35f; col.y *= 0.35f; col.z *= 0.35f; }
+
+    /* the scale must follow what is actually drawn. Deriving it from the
+       persistence arrays alone meant that clearing them collapsed the axis
+       to the 1e-6 seed and the live trace fell outside it. */
+    double target = 1e-6;
+    for (int c = 0; c < PKTS_PER_FRAME; c++) {
+        if (fabs(g_hi[c]) > target) target = fabs(g_hi[c]);
+        if (fabs(g_lo[c]) > target) target = fabs(g_lo[c]);
+        if (g_persist) {
+            if (fabs(g_phi[c]) > target) target = fabs(g_phi[c]);
+            if (fabs(g_plo[c]) > target) target = fabs(g_plo[c]);
+        }
+    }
+    if (target < 1e-4) target = 1e-4;     /* floor, so it can never collapse */
+    target *= 1.15;
+
+    /* rise at once so a real signal is never clipped, fall slowly so the
+       axis cannot flap from frame to frame */
+    double *S = &g_span_hold[idx];
+    *S = (target > *S) ? target : *S + (target - *S) * 0.05;
+    double span = *S;
 
     ImPlotAxisFlags xf = ImPlotAxisFlags_Lock;
     if (!show_x) xf |= ImPlotAxisFlags_NoTickLabels;
@@ -288,6 +422,40 @@ static void draw_trace(const char *title,
     }
 }
 
+static void lane_status(const char *name, int idx, uint64_t now)
+{
+    uint64_t last = g_last_us[idx].load();
+    uint64_t age  = (last == 0) ? 0 : now - last;
+
+    if (last == 0) {
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1),
+                           "  %s  no frame yet", name);
+        return;
+    }
+    if (age > STALE_US) {
+        ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
+                           "  %s  STALE %.1f s  -- showing the last frame, "
+                           "not live", name, age / 1e6);
+        return;
+    }
+
+    float dci, dcq;
+    {
+        std::lock_guard<std::mutex> lk(g_env_mtx[idx]);
+        dci = g_env[idx].dc_i;
+        dcq = g_env[idx].dc_q;
+    }
+
+    if (g_measure_dc.load())
+        ImGui::Text("  %s  %u/640 cells    DC  I=%+.0f  Q=%+.0f counts "
+                    "(%.2f%% FS)",
+                    name, g_cells[idx].load(), dci, dcq,
+                    100.0 * sqrt((double)dci * dci + (double)dcq * dcq)
+                          / FULL_SCALE);
+    else
+        ImGui::Text("  %s  %u/640 cells", name, g_cells[idx].load());
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 3) {
@@ -305,13 +473,12 @@ int main(int argc, char **argv)
 
     memset(&g_dl, 0, sizeof g_dl);
     memset(&g_ul, 0, sizeof g_ul);
-    g_dl.is_dl = 1;
+    g_dl.idx = 1;
+    g_ul.idx = 0;
 
-    for (int c = 0; c < PKTS_PER_FRAME; c++) {
-        g_dl_lo[c] = g_dl_hi[c] = g_ul_lo[c] = g_ul_hi[c] = 0.0f;
-        g_dl_plo[c] = g_dl_phi[c] = g_ul_plo[c] = g_ul_phi[c] = 0.0f;
+    for (int c = 0; c < PKTS_PER_FRAME; c++)
         g_xs[c] = (double)c / (double)PKTS_PER_SLOT;   /* x in slot units */
-    }
+
     for (int s = 0; s <= SLOTS_PER_FRAME; s++) g_grid[s] = s;
     for (int s = 0; s < SLOTS_PER_FRAME; s++) {
         g_tick_pos[s] = s + 0.5;
@@ -323,7 +490,7 @@ int main(int argc, char **argv)
     if (!glfwInit()) { std::cerr << "glfwInit failed\n"; return 1; }
 
     glfwDefaultWindowHints();
-    GLFWwindow *window = glfwCreateWindow(1400, 820,
+    GLFWwindow *window = glfwCreateWindow(1400, 860,
                                           "Split 8 fronthaul scope",
                                           nullptr, nullptr);
     if (!window) { std::cerr << "no window - is DISPLAY set?\n"; glfwTerminate(); return 1; }
@@ -364,10 +531,14 @@ int main(int argc, char **argv)
                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
 
-        uint32_t drop = g_drop.load(), ifdrop = g_ifdrop.load();
+        uint64_t now    = now_us();
+        uint32_t drop   = g_drop.load(), ifdrop = g_ifdrop.load();
+        bool stale_dl   = (g_last_us[1].load() == 0) ||
+                          (now - g_last_us[1].load() > STALE_US);
+        bool stale_ul   = (g_last_us[0].load() == 0) ||
+                          (now - g_last_us[0].load() > STALE_US);
 
-        ImGui::Text("%s   DL src %s   |   %u/640 cells DL   %u/640 cells UL",
-                    argv[1], argv[2], g_cells_dl.load(), g_cells_ul.load());
+        ImGui::Text("%s   DL src %s", argv[1], argv[2]);
 
         if (drop || ifdrop)
             ImGui::TextColored(ImVec4(1, 0.25f, 0.25f, 1),
@@ -376,18 +547,32 @@ int main(int argc, char **argv)
         else
             ImGui::TextColored(ImVec4(0.3f, 1, 0.3f, 1), "clean  drop=0 ifdrop=0");
 
+        if (g_bad.load() || g_trunc.load())
+            ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1),
+                               "rejected: bad=%llu trunc=%llu",
+                               (unsigned long long)g_bad.load(),
+                               (unsigned long long)g_trunc.load());
+
+        lane_status("DL", 1, now);
+        lane_status("UL", 0, now);
+
         ImGui::Checkbox("persistence", &g_persist);
         ImGui::SameLine();
-        if (ImGui::Button("clear")) { g_reset_dl.store(true); g_reset_ul.store(true); }
+        if (ImGui::Button("clear")) { g_reset[0].store(true); g_reset[1].store(true); }
         ImGui::SameLine();
         ImGui::Checkbox("auto range each channel", &g_autofit);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(200);
+        ImGui::SliderFloat("afterglow", &g_afterglow, 0.0f, 20.0f,
+                           g_afterglow < 0.01f ? "hold" : "%.1f s");
+        ImGui::SameLine();
+        bool dc = g_measure_dc.load();
+        if (ImGui::Checkbox("measure DC", &dc)) g_measure_dc.store(dc);
 
         if (ImPlot::BeginSubplots("##stack", 2, 1, ImVec2(-1, -1),
                                   ImPlotSubplotFlags_LinkCols)) {
-            draw_trace("DL   gNB -> UE", g_dl_lo, g_dl_hi, g_dl_plo, g_dl_phi,
-                       COL_DL, false);
-            draw_trace("UL   UE -> gNB", g_ul_lo, g_ul_hi, g_ul_plo, g_ul_phi,
-                       COL_UL, true);
+            draw_trace("DL   gNB -> UE", 1, COL_DL, false, stale_dl);
+            draw_trace("UL   UE -> gNB", 0, COL_UL, true,  stale_ul);
             ImPlot::EndSubplots();
         }
 
