@@ -289,9 +289,8 @@ typedef struct {
     std::mutex         mtx;
     std::vector<float> elo, ehi, eplo, ephi;
     float  dc_i, dc_q;
-    int    peak_cell;
+    int    peak_cell;        /* -1 when the lane is silent; gates the lock */
     float  peak_span, peak_abs;
-    int    b0, b1, nburst;
     int    shift;
     double corr;
     int    elocked;
@@ -316,6 +315,14 @@ static std::atomic<uint64_t> g_bad(0), g_trunc(0);
 static std::atomic<bool>     g_running(true);
 static std::atomic<bool>     g_measure_dc(false);
 static std::atomic<bool>     g_align(false);
+
+/* RUN/STOP. Stopping discards packets at the top of on_packet rather than
+   tearing down the capture: pcap_loop keeps draining the socket, so the
+   kernel ring never overflows and RUN resumes on live data instead of a
+   backlog. Nothing reaches a lane, so every number and every trace freezes
+   by itself - no snapshot machinery needed. */
+static std::atomic<bool>     g_acquire(true);
+static std::atomic<uint64_t> g_stop_us(0);
 
 static pcap_t *g_ph = NULL;
 
@@ -355,7 +362,6 @@ static void lane_alloc(lane_t *L, int idx)
     L->last_cell = 0; L->started = 0;
     L->dc_i = L->dc_q = 0.f;
     L->peak_cell = -1; L->peak_span = L->peak_abs = 0.f;
-    L->b0 = L->b1 = -1; L->nburst = 0;
     L->shift = 0; L->corr = 0.0; L->elocked = 0;
     L->cells.store(0); L->pkts.store(0); L->pps.store(0); L->last_us.store(0);
     L->reset.store(false); L->reacquire.store(false); L->drift_reset.store(false);
@@ -461,14 +467,6 @@ static void finish_frame(lane_t *L)
 
     if (peak_span < burst_floor) { peak_cell = -1; peak_span = 0.0f; }
 
-    int b0 = -1, b1 = -1, nburst = 0;
-    if (peak_cell >= 0) {
-        float thr = peak_span * BURST_FRAC;
-        if (thr < burst_floor) thr = burst_floor;
-        for (int c = 0; c < N; c++)
-            if (L->span[c] >= thr) { if (b0 < 0) b0 = c; b1 = c; nburst++; }
-    }
-
     int    shift = 0;
     double corr  = 0.0;
 
@@ -543,7 +541,6 @@ static void finish_frame(lane_t *L)
         L->dc_i = (float)((double)tot_i / n);
         L->dc_q = (float)((double)tot_q / n);
         L->peak_cell = peak_cell; L->peak_span = peak_span; L->peak_abs = peak_abs;
-        L->b0 = b0; L->b1 = b1; L->nburst = nburst;
         L->shift = disp_shift; L->corr = corr; L->elocked = L->locked;
     }
     L->cells.store(have);
@@ -555,6 +552,8 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
                       const unsigned char *bytes)
 {
     (void)user;
+
+    if (!g_acquire.load(std::memory_order_relaxed)) return;   /* STOPPED */
 
     const int need = C.hdr_off + C.iq_off + C.spp * 4;
     if ((int)h->caplen < need) { g_trunc++; return; }
@@ -618,6 +617,7 @@ static void stats_thread()
     uint64_t prev[MAX_LANES] = { 0 };
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (!g_acquire.load()) continue;        /* hold drop/ifdrop/pkt-s */
         if (g_ph && pcap_stats(g_ph, &st) == 0) {
             g_drop.store(st.ps_drop - pd);
             g_ifdrop.store(st.ps_ifdrop - pi);
@@ -751,104 +751,52 @@ static void draw_lane(lane_t *L, int idx, ImVec4 col, bool show_x,
     }
 }
 
-/* Every status block is exactly LANE_LINES tall, whatever it has to say.
-   Lines appearing and disappearing - a lane losing lock, going stale, a
-   burst coming and going - changed the header height frame to frame, and
-   since the plots fill whatever space is left, the whole display jumped. */
-#define LANE_LINES 3
-
-static void pad_to(int used)
-{
-    for (int i = used; i < LANE_LINES; i++) ImGui::TextUnformatted(" ");
-}
-
-static void lane_status(lane_t *L, int idx, ImVec4 col, uint64_t now, bool blank)
+/* One line per lane, always exactly one. Lines appearing and disappearing
+   changed the header height frame to frame, and since the plots fill what
+   is left, the whole display jumped. */
+static void lane_status(lane_t *L, ImVec4 col, uint64_t now, bool blank)
 {
     const uint64_t last = L->last_us.load();
+    const uint64_t rate = L->pps.load();
+
     if (last == 0) {
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1),
-                           "  %-30s no frame yet", L->title);
-        pad_to(1);
+        /* receiving but never assembling looked identical to silent, because
+           this branch used to return before printing the packet rate */
+        ImGui::TextColored(ImVec4(0.65f, 0.65f, 0.65f, 1),
+                           "  %-26s %6llu pkt/s   no frame assembled",
+                           L->title, (unsigned long long)rate);
         return;
     }
     const uint64_t age = now - last;
 
     if (blank) {
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1),
-                           "  %-30s NO SIGNAL  -- quiet for %.0f s, cleared",
+                           "  %-26s NO SIGNAL  -- quiet for %.0f s",
                            L->title, age / 1e6);
-        pad_to(1);
         return;
     }
     if (age > STALE_US) {
         ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
-                           "  %-30s STALE %.1f s  -- last frame, not live",
+                           "  %-26s STALE %.1f s  -- last frame, not live",
                            L->title, age / 1e6);
-        pad_to(1);
         return;
     }
 
     float dci, dcq, pabs;
-    int   pc, b0, b1, nb, sh, lk;
-    double cr;
+    int   pc;
     {
-        std::lock_guard<std::mutex> lk2(L->mtx);
-        dci = L->dc_i; dcq = L->dc_q; pabs = L->peak_abs;
-        pc = L->peak_cell; b0 = L->b0; b1 = L->b1; nb = L->nburst;
-        sh = L->shift; cr = L->corr; lk = L->elocked;
+        std::lock_guard<std::mutex> g(L->mtx);
+        dci = L->dc_i; dcq = L->dc_q; pabs = L->peak_abs; pc = L->peak_cell;
     }
 
-    char dcbuf[72] = "";
+    char dcbuf[48] = "";
     if (g_measure_dc.load())
-        snprintf(dcbuf, sizeof dcbuf, "   DC I=%+.0f Q=%+.0f (%.2f%% FS)",
-                 dci, dcq,
-                 100.0 * sqrt((double)dci * dci + (double)dcq * dcq) / C.full_scale);
+        snprintf(dcbuf, sizeof dcbuf, "   DC I=%+.0f Q=%+.0f", dci, dcq);
 
-    ImGui::TextColored(col, "  %-30s %u/%d cells   %llu pkt/s   peak %.4f%s",
+    ImGui::TextColored(col, "  %-26s %3u/%d cells  %6llu pkt/s  peak %.4f%s%s",
                        L->title, L->cells.load(), C.cells,
-                       (unsigned long long)L->pps.load(), pabs, dcbuf);
-
-    if (pc < 0) {
-        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1),
-                           "      no burst above the noise floor");
-        pad_to(2);
-        return;
-    }
-
-    /* The peak cell is deliberately not shown. With more than one burst it
-       just names whichever happens to be tallest this frame, which is the
-       same single-point fragility that made peak-latched triggering
-       useless. It is still computed, as the gate that decides whether
-       there is a burst at all. */
-    const double w = (double)(b1 - b0 + 1);
-    ImGui::Text("      burst %d..%d = slot %.2f..%.2f   width %.0f us (%d cells)"
-                "   duty %.1f%%",
-                b0, b1, b0 / (double)C.pps, (b1 + 1) / (double)C.pps,
-                w * C.cell_us, (int)w, 100.0 * nb / (double)C.cells);
-
-    if (!lk) {
-        ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
-                           "      NO LOCK (corr %.2f) -- no repeating pattern "
-                           "to align to; drift not measurable", cr);
-        pad_to(3);
-        return;
-    }
-
-    const double ppm  = L->ppm.load();
-    const double secs = L->drift_secs.load();
-    const ImVec4 pcol = (secs < 30.0) ? ImVec4(0.65f, 0.65f, 0.65f, 1)
-                                      : ImVec4(1.0f, 0.8f, 0.3f, 1);
-    ImGui::TextColored(pcol,
-        "      lock corr %.2f  shift %d cells   drift %+.3f ppm over %.0f s%s",
-        cr, sh, ppm, secs, (secs < 30.0) ? "  (too short to trust)" : "");
-
-    /* the reset sits next to the number it resets, and is per lane - drift
-       is a slow measurement and restarting one sender's baseline should not
-       disturb another's */
-    ImGui::SameLine();
-    ImGui::PushID(idx);
-    if (ImGui::SmallButton("reset")) L->drift_reset.store(true);
-    ImGui::PopID();
+                       (unsigned long long)rate, pabs,
+                       (pc < 0) ? "   silent" : "", dcbuf);
 }
 
 static void cursor_readout(lane_t *L, int idx)
@@ -1006,74 +954,120 @@ int main(int argc, char **argv)
         for (int i = 0; i < lanes; i++) {
             const uint64_t last = g_lane[i].last_us.load();
             const uint64_t age  = last ? now - last : 0;
-            stale[i] = last && age > STALE_US;
-            blank[i] = last && age > blank_us;
+            /* with acquisition stopped last_us stops advancing, so both of
+               these would fire and wipe the screen a few seconds after you
+               pressed STOP - which is exactly what must not happen */
+            stale[i] = g_acquire.load() && last && age > STALE_US;
+            blank[i] = g_acquire.load() && last && age > blank_us;
             total_pps += g_lane[i].pps.load();
         }
         const double gbps = (double)total_pps *
                             (double)(C.hdr_off + C.iq_off + C.spp * 4) * 8.0 / 1e9;
 
-        ImGui::Text("%s   %d sender%s   |   %.2f Msps  mu=%d  %d sam/pkt  "
-                    "%d pkt/slot  %d slots  %d cells/frame",
-                    iface, lanes, lanes == 1 ? "" : "s",
-                    C.rate_hz / 1e6, C.mu, C.spp, C.pps, C.slots, C.cells);
+        const bool  running = g_acquire.load();
+        const float winw    = ImGui::GetWindowWidth();
 
-        if (drop || ifdrop)
-            ImGui::TextColored(ImVec4(1, 0.25f, 0.25f, 1),
-                               "LOSSY  drop=+%u ifdrop=+%u   -- traces have holes",
-                               drop, ifdrop);
-        else
-            ImGui::TextColored(ImVec4(0.3f, 1, 0.3f, 1), "clean  drop=0 ifdrop=0");
+        ImGui::BeginGroup();      /* ---- left column: status ---- */
+
+        ImGui::Text("%s   %d sender%s   %.2f Msps  mu=%d",
+                    iface, lanes, lanes == 1 ? "" : "s", C.rate_hz / 1e6, C.mu);
 
         /* drop and ifdrop are blind to loss inside the switch. If the senders'
            combined rate approaches the mirror port's line rate, cells can sit
-           below full on a capture that calls itself clean. */
-        ImGui::Text("%llu pkt/s   %.2f Gbit/s on the mirror   bad=%llu trunc=%llu",
-                    (unsigned long long)total_pps, gbps,
-                    (unsigned long long)g_bad.load(),
-                    (unsigned long long)g_trunc.load());
+           below full on a capture that calls itself clean - which is what the
+           Gbit/s figure is here to let you notice. */
+        char badbuf[64] = "";
+        if (g_bad.load() || g_trunc.load())
+            snprintf(badbuf, sizeof badbuf, "   bad=%llu trunc=%llu",
+                     (unsigned long long)g_bad.load(),
+                     (unsigned long long)g_trunc.load());
+
+        if (!running)
+            ImGui::TextColored(ImVec4(1, 0.7f, 0.2f, 1),
+                               "STOPPED  -- frozen %.0f s ago, not live",
+                               (now - g_stop_us.load()) / 1e6);
+        else if (drop || ifdrop)
+            ImGui::TextColored(ImVec4(1, 0.25f, 0.25f, 1),
+                               "LOSSY  drop=+%u ifdrop=+%u   %llu pkt/s   "
+                               "%.2f Gbit/s%s", drop, ifdrop,
+                               (unsigned long long)total_pps, gbps, badbuf);
+        else
+            ImGui::TextColored(ImVec4(0.3f, 1, 0.3f, 1),
+                               "clean  drop=0 ifdrop=0   %llu pkt/s   "
+                               "%.2f Gbit/s%s",
+                               (unsigned long long)total_pps, gbps, badbuf);
 
         for (int i = 0; i < lanes; i++)
-            lane_status(&g_lane[i], i, COL[i % MAX_LANES], now, blank[i]);
+            lane_status(&g_lane[i], COL[i % MAX_LANES], now, blank[i]);
 
-        /* always drawn, even when empty, so the header height never changes */
+        ImGui::EndGroup();
+
+        /* ---- right: acquisition, on its own, away from everything else ---- */
+        ImGui::SameLine(winw - 186.0f);
+        ImGui::BeginGroup();
+        {
+            const ImVec4 red  (0.78f, 0.17f, 0.17f, 1.0f);
+            const ImVec4 redh (0.90f, 0.26f, 0.26f, 1.0f);
+            const ImVec4 grn  (0.13f, 0.60f, 0.24f, 1.0f);
+            const ImVec4 grnh (0.20f, 0.72f, 0.33f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button,        running ? red  : grn);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, running ? redh : grnh);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  running ? redh : grnh);
+            if (ImGui::Button(running ? "STOP" : "RUN", ImVec2(160, 58))) {
+                g_acquire.store(!running);
+                if (running) g_stop_us.store(now);
+            }
+            ImGui::PopStyleColor(3);
+        }
+        ImGui::EndGroup();
+
         const uint64_t ovf = g_overflow.load();
         if (ovf)
             ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1),
                                "  more than %d senders -- %llu packets ignored "
                                "rather than folded into another lane",
                                MAX_LANES, (unsigned long long)ovf);
-        else
-            ImGui::TextUnformatted(" ");
 
         if (g_cursors)
             for (int i = 0; i < lanes; i++) cursor_readout(&g_lane[i], i);
 
+        ImGui::Separator();
+
+        /* two groups rather than one pile: what the display does on the left,
+           what you measure with on the right */
+        ImGui::BeginGroup();
+        ImGui::TextColored(ImVec4(0.55f, 0.6f, 0.7f, 1), "display");
         ImGui::Checkbox("persistence", &g_persist);
         ImGui::SameLine();
         if (ImGui::Button("clear"))
             for (int i = 0; i < lanes; i++) g_lane[i].reset.store(true);
         ImGui::SameLine();
         ImGui::Checkbox("auto range", &g_autofit);
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(170);
+        ImGui::SetNextItemWidth(150);
         ImGui::SliderFloat("afterglow", &g_afterglow, 0.0f, 20.0f,
                            g_afterglow < 0.01f ? "hold" : "%.1f s");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(170);
+        ImGui::SetNextItemWidth(150);
         ImGui::SliderFloat("blank after", &g_blank_secs, 1.0f, 30.0f, "%.0f s");
+        ImGui::EndGroup();
 
+        ImGui::SameLine(winw * 0.52f);
+
+        ImGui::BeginGroup();
+        ImGui::TextColored(ImVec4(0.55f, 0.6f, 0.7f, 1), "measure");
+        ImGui::Checkbox("cursors", &g_cursors);
+        ImGui::SameLine();
+        bool dc = g_measure_dc.load();
+        if (ImGui::Checkbox("measure DC", &dc)) g_measure_dc.store(dc);
         bool al = g_align.load();
         if (ImGui::Checkbox("align", &al)) g_align.store(al);
         ImGui::SameLine();
         /* re-acquire clears persistence too - see finish_frame */
         if (ImGui::Button("re-acquire"))
             for (int i = 0; i < lanes; i++) g_lane[i].reacquire.store(true);
-        ImGui::SameLine();
-        ImGui::Checkbox("cursors", &g_cursors);
-        ImGui::SameLine();
-        bool dc = g_measure_dc.load();
-        if (ImGui::Checkbox("measure DC", &dc)) g_measure_dc.store(dc);
+        ImGui::EndGroup();
+
+        ImGui::Separator();
 
         if (lanes == 0) {
             ImGui::Dummy(ImVec2(0, 20));
