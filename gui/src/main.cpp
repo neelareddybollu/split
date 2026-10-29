@@ -422,7 +422,15 @@ static int best_shift(const std::vector<float> &x, const std::vector<float> &ref
 static void finish_frame(lane_t *L)
 {
     const int N = C.cells;
-    const bool clear = L->reset.exchange(false);
+
+    /* Re-acquiring implies clearing. The moment the correlation reference
+       moves, the persistence band was accumulated at the old alignment and
+       describes a position the trace no longer occupies - keeping it would
+       show a band that is simply in the wrong place. */
+    const bool reacq = L->reacquire.exchange(false);
+    const bool clear = L->reset.exchange(false) || reacq;
+    if (reacq) { L->have_ref = 0; L->locked = 0; }
+
     const float burst_floor = BURST_FLOOR_LSB / (float)C.full_scale;
 
     float k = 0.0f;
@@ -463,8 +471,6 @@ static void finish_frame(lane_t *L)
 
     int    shift = 0;
     double corr  = 0.0;
-
-    if (L->reacquire.exchange(false)) { L->have_ref = 0; L->locked = 0; }
 
     if (peak_cell >= 0) {
         if (!L->have_ref) {
@@ -745,7 +751,7 @@ static void draw_lane(lane_t *L, int idx, ImVec4 col, bool show_x,
     }
 }
 
-static void lane_status(lane_t *L, ImVec4 col, uint64_t now, bool blank)
+static void lane_status(lane_t *L, int idx, ImVec4 col, uint64_t now, bool blank)
 {
     const uint64_t last = L->last_us.load();
     if (last == 0) {
@@ -794,11 +800,15 @@ static void lane_status(lane_t *L, ImVec4 col, uint64_t now, bool blank)
         return;
     }
 
+    /* The peak cell is deliberately not shown. With more than one burst it
+       just names whichever happens to be tallest this frame, which is the
+       same single-point fragility that made peak-latched triggering
+       useless. It is still computed, as the gate that decides whether
+       there is a burst at all. */
     const double w = (double)(b1 - b0 + 1);
-    ImGui::Text("      peak cell %d (slot %.2f)   burst %d..%d = slot %.2f..%.2f"
-                "   width %.0f us (%d cells)   duty %.1f%%",
-                pc, pc / (double)C.pps, b0, b1,
-                b0 / (double)C.pps, (b1 + 1) / (double)C.pps,
+    ImGui::Text("      burst %d..%d = slot %.2f..%.2f   width %.0f us (%d cells)"
+                "   duty %.1f%%",
+                b0, b1, b0 / (double)C.pps, (b1 + 1) / (double)C.pps,
                 w * C.cell_us, (int)w, 100.0 * nb / (double)C.cells);
 
     if (!lk) {
@@ -815,6 +825,14 @@ static void lane_status(lane_t *L, ImVec4 col, uint64_t now, bool blank)
     ImGui::TextColored(pcol,
         "      lock corr %.2f  shift %d cells   drift %+.3f ppm over %.0f s%s",
         cr, sh, ppm, secs, (secs < 30.0) ? "  (too short to trust)" : "");
+
+    /* the reset sits next to the number it resets, and is per lane - drift
+       is a slow measurement and restarting one sender's baseline should not
+       disturb another's */
+    ImGui::SameLine();
+    ImGui::PushID(idx);
+    if (ImGui::SmallButton("reset")) L->drift_reset.store(true);
+    ImGui::PopID();
 }
 
 static void cursor_readout(lane_t *L, int idx)
@@ -1000,7 +1018,7 @@ int main(int argc, char **argv)
                     (unsigned long long)g_trunc.load());
 
         for (int i = 0; i < lanes; i++)
-            lane_status(&g_lane[i], COL[i % MAX_LANES], now, blank[i]);
+            lane_status(&g_lane[i], i, COL[i % MAX_LANES], now, blank[i]);
 
         const uint64_t ovf = g_overflow.load();
         if (ovf)
@@ -1029,6 +1047,7 @@ int main(int argc, char **argv)
         bool al = g_align.load();
         if (ImGui::Checkbox("align", &al)) g_align.store(al);
         ImGui::SameLine();
+        /* re-acquire clears persistence too - see finish_frame */
         if (ImGui::Button("re-acquire"))
             for (int i = 0; i < lanes; i++) g_lane[i].reacquire.store(true);
         ImGui::SameLine();
@@ -1036,9 +1055,6 @@ int main(int argc, char **argv)
         ImGui::SameLine();
         bool dc = g_measure_dc.load();
         if (ImGui::Checkbox("measure DC", &dc)) g_measure_dc.store(dc);
-        ImGui::SameLine();
-        if (ImGui::Button("reset drift"))
-            for (int i = 0; i < lanes; i++) g_lane[i].drift_reset.store(true);
 
         if (lanes == 0) {
             ImGui::Dummy(ImVec2(0, 20));
