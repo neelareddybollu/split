@@ -751,12 +751,24 @@ static void draw_lane(lane_t *L, int idx, ImVec4 col, bool show_x,
     }
 }
 
+/* Every status block is exactly LANE_LINES tall, whatever it has to say.
+   Lines appearing and disappearing - a lane losing lock, going stale, a
+   burst coming and going - changed the header height frame to frame, and
+   since the plots fill whatever space is left, the whole display jumped. */
+#define LANE_LINES 3
+
+static void pad_to(int used)
+{
+    for (int i = used; i < LANE_LINES; i++) ImGui::TextUnformatted(" ");
+}
+
 static void lane_status(lane_t *L, int idx, ImVec4 col, uint64_t now, bool blank)
 {
     const uint64_t last = L->last_us.load();
     if (last == 0) {
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1),
                            "  %-30s no frame yet", L->title);
+        pad_to(1);
         return;
     }
     const uint64_t age = now - last;
@@ -765,12 +777,14 @@ static void lane_status(lane_t *L, int idx, ImVec4 col, uint64_t now, bool blank
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1),
                            "  %-30s NO SIGNAL  -- quiet for %.0f s, cleared",
                            L->title, age / 1e6);
+        pad_to(1);
         return;
     }
     if (age > STALE_US) {
         ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
                            "  %-30s STALE %.1f s  -- last frame, not live",
                            L->title, age / 1e6);
+        pad_to(1);
         return;
     }
 
@@ -797,6 +811,7 @@ static void lane_status(lane_t *L, int idx, ImVec4 col, uint64_t now, bool blank
     if (pc < 0) {
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1),
                            "      no burst above the noise floor");
+        pad_to(2);
         return;
     }
 
@@ -815,6 +830,7 @@ static void lane_status(lane_t *L, int idx, ImVec4 col, uint64_t now, bool blank
         ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
                            "      NO LOCK (corr %.2f) -- no repeating pattern "
                            "to align to; drift not measurable", cr);
+        pad_to(3);
         return;
     }
 
@@ -1020,12 +1036,15 @@ int main(int argc, char **argv)
         for (int i = 0; i < lanes; i++)
             lane_status(&g_lane[i], i, COL[i % MAX_LANES], now, blank[i]);
 
+        /* always drawn, even when empty, so the header height never changes */
         const uint64_t ovf = g_overflow.load();
         if (ovf)
             ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1),
                                "  more than %d senders -- %llu packets ignored "
                                "rather than folded into another lane",
                                MAX_LANES, (unsigned long long)ovf);
+        else
+            ImGui::TextUnformatted(" ");
 
         if (g_cursors)
             for (int i = 0; i < lanes; i++) cursor_readout(&g_lane[i], i);
