@@ -299,6 +299,10 @@ typedef struct {
     std::atomic<uint64_t> pkts, pps, last_us;
     std::atomic<bool>     reset, reacquire, drift_reset;
     std::atomic<double>   ppm, drift_secs;
+
+    /* render thread only - a stored frame to compare the live one against */
+    std::vector<double> ref_lo, ref_hi;
+    int                 has_ref;
 } lane_t;
 
 static lane_t g_lane[MAX_LANES];
@@ -324,13 +328,50 @@ static std::atomic<bool>     g_align(false);
 static std::atomic<bool>     g_acquire(true);
 static std::atomic<uint64_t> g_stop_us(0);
 
+/* ---- Stop when: arm a condition, walk away, come back to a frozen screen
+   showing the moment it fired. With no condition ticked it stops on the
+   very next frame, which is a scope's SINGLE. ---- */
+static std::atomic<bool>  g_armed(false);
+static std::atomic<bool>  g_trg_cells(false);
+static std::atomic<int>   g_trg_cells_n(640);
+static std::atomic<bool>  g_trg_slot(false);
+static std::atomic<int>   g_trg_slot_n(8);
+static std::atomic<bool>  g_trg_silent(false);
+static std::atomic<bool>  g_trg_drop(false);
+static std::mutex         g_trg_mtx;
+static char               g_trg_reason[160] = "";
+
+static void trigger_fire(const char *why, uint64_t now)
+{
+    {
+        std::lock_guard<std::mutex> g(g_trg_mtx);
+        snprintf(g_trg_reason, sizeof g_trg_reason, "%s", why);
+    }
+    g_armed.store(false);
+    g_stop_us.store(now);
+    g_acquire.store(false);
+}
+
 static pcap_t *g_ph = NULL;
 
-static bool  g_persist    = true;
+/* one control, three states, instead of a checkbox and a slider that both
+   governed the same thing */
+enum { AG_OFF = 0, AG_FADE = 1, AG_HOLD = 2 };
+static int   g_ag_mode    = AG_FADE;
+static bool  g_persist    = true;          /* derived from g_ag_mode */
 static bool  g_autofit    = true;
 static bool  g_cursors    = false;
 static float g_afterglow  = 3.0f;
 static float g_blank_secs = 3.0f;
+
+/* Compare: freeze a known-good frame and hold the live one against it */
+enum { CMP_OFF = 0, CMP_OVERLAY = 1, CMP_DIFF = 2 };
+static int  g_cmp_mode = CMP_OFF;
+static bool g_save_ref = false;
+
+/* Zoom: look at a slot range instead of the whole frame */
+static bool  g_zoom    = false;
+static float g_zoom_lo = 0.0f, g_zoom_hi = 2.0f;
 
 static double g_cx[MAX_LANES][2];
 static double g_cy[MAX_LANES][2];
@@ -366,6 +407,7 @@ static void lane_alloc(lane_t *L, int idx)
     L->cells.store(0); L->pkts.store(0); L->pps.store(0); L->last_us.store(0);
     L->reset.store(false); L->reacquire.store(false); L->drift_reset.store(false);
     L->ppm.store(0.0); L->drift_secs.store(0.0);
+    L->ref_lo.assign(N, 0.0); L->ref_hi.assign(N, 0.0); L->has_ref = 0;
     g_cx[idx][0] = 4.0;  g_cx[idx][1] = 8.0;
     g_cy[idx][0] = -0.1; g_cy[idx][1] = 0.1;
     g_span_hold[idx] = 1e-4;
@@ -543,6 +585,36 @@ static void finish_frame(lane_t *L)
         L->peak_cell = peak_cell; L->peak_span = peak_span; L->peak_abs = peak_abs;
         L->shift = disp_shift; L->corr = corr; L->elocked = L->locked;
     }
+    /* ---- Stop when ---- */
+    if (g_armed.load() && g_acquire.load()) {
+        char why[160];
+        const char *fired = NULL;
+
+        if (g_trg_cells.load() && (int)have < g_trg_cells_n.load()) {
+            snprintf(why, sizeof why, "%s  %u/%d cells (below %d)",
+                     L->title, have, N, g_trg_cells_n.load());
+            fired = why;
+        } else if (g_trg_slot.load()) {
+            const int sl = g_trg_slot_n.load();
+            const int c0 = sl * C.pps, c1 = c0 + C.pps;
+            if (c0 >= 0 && c1 <= N) {
+                float mx = 0.0f;
+                for (int c = c0; c < c1; c++)
+                    if (L->span[c] > mx) mx = L->span[c];
+                if (mx > burst_floor * 4.0f) {
+                    snprintf(why, sizeof why,
+                             "%s  energy in slot %d (%.4f)", L->title, sl, mx);
+                    fired = why;
+                }
+            }
+        } else if (!g_trg_cells.load() && !g_trg_silent.load() &&
+                   !g_trg_drop.load()) {
+            snprintf(why, sizeof why, "%s  single frame captured", L->title);
+            fired = why;                      /* no condition = SINGLE */
+        }
+        if (fired) trigger_fire(fired, now);
+    }
+
     L->cells.store(have);
     L->last_us.store(now);
 }
@@ -690,6 +762,18 @@ static void draw_lane(lane_t *L, int idx, ImVec4 col, bool show_x,
         }
     }
 
+    /* Compare: snapshot the live frame, or hold it against the stored one */
+    if (g_save_ref && !blank) {
+        L->ref_lo.assign(g_lo.begin(), g_lo.begin() + N);
+        L->ref_hi.assign(g_hi.begin(), g_hi.begin() + N);
+        L->has_ref = 1;
+    }
+    if (g_cmp_mode == CMP_DIFF && L->has_ref)
+        for (int c = 0; c < N; c++) {
+            g_lo[c] -= L->ref_lo[c];
+            g_hi[c] -= L->ref_hi[c];
+        }
+
     if (stale) { col.x *= 0.35f; col.y *= 0.35f; col.z *= 0.35f; }
 
     double target = 1e-6;
@@ -716,7 +800,10 @@ static void draw_lane(lane_t *L, int idx, ImVec4 col, bool show_x,
 
     if (ImPlot::BeginPlot(L->title, ImVec2(-1, -1), ImPlotFlags_NoLegend)) {
         ImPlot::SetupAxes(xlabel, "amplitude", xf, ImPlotAxisFlags_Lock);
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0, C.slots, ImPlotCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_X1,
+                                g_zoom ? g_zoom_lo : 0.0,
+                                g_zoom ? g_zoom_hi : (double)C.slots,
+                                ImPlotCond_Always);
         ImPlot::SetupAxisLimits(ImAxis_Y1,
                                 g_autofit ? -span : -1.0,
                                 g_autofit ?  span :  1.0, ImPlotCond_Always);
@@ -737,6 +824,15 @@ static void draw_lane(lane_t *L, int idx, ImVec4 col, bool show_x,
             for (int c = 0; c < N; c++) g_mid[c] = 0.5 * (g_lo[c] + g_hi[c]);
             ImPlot::SetNextLineStyle(col, 1.6f);
             ImPlot::PlotLine("##mid", g_xs.data(), g_mid.data(), N);
+
+            /* the stored frame, drawn over the live one */
+            if (g_cmp_mode == CMP_OVERLAY && L->has_ref) {
+                const ImVec4 rc(0.85f, 0.85f, 0.95f, 0.9f);
+                ImPlot::SetNextLineStyle(rc, 1.2f);
+                ImPlot::PlotLine("##reflo", g_xs.data(), L->ref_lo.data(), N);
+                ImPlot::SetNextLineStyle(rc, 1.2f);
+                ImPlot::PlotLine("##refhi", g_xs.data(), L->ref_hi.data(), N);
+            }
         }
 
         if (g_cursors) {
@@ -959,10 +1055,26 @@ int main(int argc, char **argv)
                pressed STOP - which is exactly what must not happen */
             stale[i] = g_acquire.load() && last && age > STALE_US;
             blank[i] = g_acquire.load() && last && age > blank_us;
+
+            if (g_armed.load() && g_acquire.load() &&
+                g_trg_silent.load() && stale[i]) {
+                char why[160];
+                snprintf(why, sizeof why, "%s went silent",
+                         g_lane[i].title);
+                trigger_fire(why, now);
+            }
             total_pps += g_lane[i].pps.load();
         }
         const double gbps = (double)total_pps *
                             (double)(C.hdr_off + C.iq_off + C.spp * 4) * 8.0 / 1e9;
+
+        if (g_armed.load() && g_acquire.load() && g_trg_drop.load() &&
+            (drop || ifdrop)) {
+            char why[160];
+            snprintf(why, sizeof why, "capture lost packets: drop=%u ifdrop=%u",
+                     drop, ifdrop);
+            trigger_fire(why, now);
+        }
 
         const bool  running = g_acquire.load();
         const float winw    = ImGui::GetWindowWidth();
@@ -982,7 +1094,15 @@ int main(int argc, char **argv)
                      (unsigned long long)g_bad.load(),
                      (unsigned long long)g_trunc.load());
 
-        if (!running)
+        char reason[160];
+        { std::lock_guard<std::mutex> g(g_trg_mtx);
+          snprintf(reason, sizeof reason, "%s", g_trg_reason); }
+
+        if (!running && reason[0])
+            ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
+                               "STOPPED %.0f s ago  --  %s",
+                               (now - g_stop_us.load()) / 1e6, reason);
+        else if (!running)
             ImGui::TextColored(ImVec4(1, 0.7f, 0.2f, 1),
                                "STOPPED  -- frozen %.0f s ago, not live",
                                (now - g_stop_us.load()) / 1e6);
@@ -1013,11 +1133,23 @@ int main(int argc, char **argv)
             ImGui::PushStyleColor(ImGuiCol_Button,        running ? red  : grn);
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, running ? redh : grnh);
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  running ? redh : grnh);
-            if (ImGui::Button(running ? "STOP" : "RUN", ImVec2(160, 58))) {
+            if (ImGui::Button(running ? "STOP" : "RUN", ImVec2(160, 48))) {
                 g_acquire.store(!running);
+                g_armed.store(false);
                 if (running) g_stop_us.store(now);
             }
             ImGui::PopStyleColor(3);
+
+            /* arm and go: resume, then stop on the next frame */
+            if (ImGui::Button("Single", ImVec2(160, 26))) {
+                { std::lock_guard<std::mutex> g(g_trg_mtx); g_trg_reason[0] = 0; }
+                g_trg_cells.store(false);  g_trg_slot.store(false);
+                g_trg_silent.store(false); g_trg_drop.store(false);
+                g_armed.store(true);
+                g_acquire.store(true);
+            }
+            if (g_armed.load())
+                ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), " ARMED");
         }
         ImGui::EndGroup();
 
@@ -1033,39 +1165,117 @@ int main(int argc, char **argv)
 
         ImGui::Separator();
 
-        /* two groups rather than one pile: what the display does on the left,
-           what you measure with on the right */
-        ImGui::BeginGroup();
-        ImGui::TextColored(ImVec4(0.55f, 0.6f, 0.7f, 1), "display");
-        ImGui::Checkbox("persistence", &g_persist);
-        ImGui::SameLine();
-        if (ImGui::Button("clear"))
-            for (int i = 0; i < lanes; i++) g_lane[i].reset.store(true);
-        ImGui::SameLine();
-        ImGui::Checkbox("auto range", &g_autofit);
-        ImGui::SetNextItemWidth(150);
-        ImGui::SliderFloat("afterglow", &g_afterglow, 0.0f, 20.0f,
-                           g_afterglow < 0.01f ? "hold" : "%.1f s");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(150);
-        ImGui::SliderFloat("blank after", &g_blank_secs, 1.0f, 30.0f, "%.0f s");
-        ImGui::EndGroup();
+        /* Tabs, not columns. Positioning the second group at a percentage of
+           the window width meant it collided with the first whenever the
+           first grew - tabs cannot overlap, and only the controls you are
+           using are on screen. */
+        if (ImGui::BeginTabBar("##tabs")) {
 
-        ImGui::SameLine(winw * 0.52f);
+            if (ImGui::BeginTabItem("View")) {
+                ImGui::SetNextItemWidth(130);
+                ImGui::Combo("Afterglow", &g_ag_mode, "Off\0Fade\0Hold\0");
+                g_persist = (g_ag_mode != AG_OFF);
+                if (g_ag_mode == AG_FADE) {
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(150);
+                    ImGui::SliderFloat("##fade", &g_afterglow, 0.2f, 20.0f, "%.1f s");
+                } else if (g_ag_mode == AG_HOLD) {
+                    g_afterglow = 0.0f;       /* never decays */
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Clear trace"))
+                    for (int i = 0; i < lanes; i++) g_lane[i].reset.store(true);
+                ImGui::SameLine();
+                ImGui::Checkbox("Auto scale", &g_autofit);
 
-        ImGui::BeginGroup();
-        ImGui::TextColored(ImVec4(0.55f, 0.6f, 0.7f, 1), "measure");
-        ImGui::Checkbox("cursors", &g_cursors);
-        ImGui::SameLine();
-        bool dc = g_measure_dc.load();
-        if (ImGui::Checkbox("measure DC", &dc)) g_measure_dc.store(dc);
-        bool al = g_align.load();
-        if (ImGui::Checkbox("align", &al)) g_align.store(al);
-        ImGui::SameLine();
-        /* re-acquire clears persistence too - see finish_frame */
-        if (ImGui::Button("re-acquire"))
-            for (int i = 0; i < lanes; i++) g_lane[i].reacquire.store(true);
-        ImGui::EndGroup();
+                ImGui::Checkbox("Zoom", &g_zoom);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(300);
+                ImGui::SliderFloat2("slots", &g_zoom_lo, 0.0f, (float)C.slots,
+                                    "%.2f");
+                if (g_zoom_hi <= g_zoom_lo) g_zoom_hi = g_zoom_lo + 0.25f;
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(150);
+                ImGui::SliderFloat("Hide silent after", &g_blank_secs,
+                                   1.0f, 30.0f, "%.0f s");
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("Measure")) {
+                ImGui::Checkbox("Cursors", &g_cursors);
+                ImGui::SameLine();
+                bool dc = g_measure_dc.load();
+                if (ImGui::Checkbox("DC offset", &dc)) g_measure_dc.store(dc);
+                ImGui::SameLine();
+                bool al = g_align.load();
+                if (ImGui::Checkbox("Lock to signal", &al)) g_align.store(al);
+                ImGui::SameLine();
+                /* re-locking clears persistence too - see finish_frame */
+                if (ImGui::Button("Re-lock"))
+                    for (int i = 0; i < lanes; i++) g_lane[i].reacquire.store(true);
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("Compare")) {
+                g_save_ref = ImGui::Button("Save reference");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(170);
+                ImGui::Combo("##cmp", &g_cmp_mode,
+                             "Off\0Overlay\0Difference\0");
+                ImGui::SameLine();
+                int nref = 0;
+                for (int i = 0; i < lanes; i++) nref += g_lane[i].has_ref;
+                if (nref)
+                    ImGui::TextColored(ImVec4(0.6f, 0.75f, 1, 1),
+                                       "reference stored for %d lane%s",
+                                       nref, nref == 1 ? "" : "s");
+                else
+                    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1),
+                                       "no reference yet");
+                ImGui::EndTabItem();
+            }
+
+            if (ImGui::BeginTabItem("Stop when")) {
+                bool armed = g_armed.load();
+                if (ImGui::Checkbox("Armed", &armed)) {
+                    g_armed.store(armed);
+                    if (armed) {
+                        std::lock_guard<std::mutex> g(g_trg_mtx);
+                        g_trg_reason[0] = 0;
+                    }
+                }
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1),
+                                   "with nothing ticked it stops on the next "
+                                   "frame (single shot)");
+
+                bool tc = g_trg_cells.load();
+                if (ImGui::Checkbox("cells below", &tc)) g_trg_cells.store(tc);
+                ImGui::SameLine();
+                int cn = g_trg_cells_n.load();
+                ImGui::SetNextItemWidth(130);
+                if (ImGui::SliderInt("##cn", &cn, 1, C.cells))
+                    g_trg_cells_n.store(cn);
+
+                bool ts = g_trg_slot.load();
+                if (ImGui::Checkbox("energy in slot", &ts)) g_trg_slot.store(ts);
+                ImGui::SameLine();
+                int sn = g_trg_slot_n.load();
+                ImGui::SetNextItemWidth(130);
+                if (ImGui::SliderInt("##sn", &sn, 0, C.slots - 1))
+                    g_trg_slot_n.store(sn);
+
+                bool tq = g_trg_silent.load();
+                if (ImGui::Checkbox("a sender goes silent", &tq))
+                    g_trg_silent.store(tq);
+                ImGui::SameLine();
+                bool td = g_trg_drop.load();
+                if (ImGui::Checkbox("capture loses packets", &td))
+                    g_trg_drop.store(td);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
 
         ImGui::Separator();
 
