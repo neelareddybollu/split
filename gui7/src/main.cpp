@@ -230,6 +230,20 @@ static int cfg_derive(void)
             if (C.nprb * 12 > C.nfft) C.nprb = C.nfft / 12;
             C.nsc = C.nprb * 12;
         } else { C.nprb = 0; C.nsc = 0; }
+
+        /* The long cyclic prefix exists to make the symbols line up with the
+           0.5 ms half-subframe boundary, so where it goes depends on how a
+           slot relates to 0.5 ms:
+
+              mu = 1   slot IS 0.5 ms      one long prefix, at symbol 0
+              mu = 0   slot is 1 ms        two per slot, symbols 0 and 7
+              mu = 2   slot is 0.25 ms     one per PAIR of slots
+
+           This code places one at symbol 0 of every slot, which is correct
+           only for mu = 1. Rather than ship placement I cannot test against a
+           real signal, the analysis is refused elsewhere. Everything else in
+           the tool is numerology-agnostic and keeps working. */
+        if (C.mu != 1) C.ofdm_ok = 0;
     }
 
     if (C.cells < 2 || C.cells > 65536) {
@@ -1227,6 +1241,9 @@ int main(int argc, char **argv)
                   << C.cp1 << ", " << C.nsym << " symbols, " << C.nprb
                   << " PRB, bin = subcarrier = "
                   << (C.rate_hz / C.nfft / 1000.0) << " kHz\n";
+    else if (C.mu != 1)
+        std::cerr << "ofdm: analysis is only validated for mu=1 (this link is mu="
+                  << C.mu << ") - the Analyse tab is disabled\n";
     else
         std::cerr << "ofdm: geometry does not close for this rate and mu - "
                      "the Analyse tab is disabled\n";
@@ -1486,7 +1503,13 @@ int main(int argc, char **argv)
             }
 
             if (ImGui::BeginTabItem("Analyse")) {
-                if (!C.ofdm_ok) {
+                if (C.mu != 1) {
+                    ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
+                        "OFDM analysis is only validated for mu=1 - this link "
+                        "is mu=%d. The long cyclic prefix sits at a different "
+                        "symbol there, and placing it wrongly would smear the "
+                        "grid without saying so.", C.mu);
+                } else if (!C.ofdm_ok) {
                     ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
                         "OFDM geometry does not close for %.2f Msps at mu=%d",
                         C.rate_hz / 1e6, C.mu);
