@@ -174,6 +174,9 @@ static void cfg_defaults(void)
     C.rate_hz = 122.88e6; C.mu = 1; C.spp = 1920; C.bits = 16;
     C.ethertype = 0xAEFE; C.seq_base = 1;
     C.hdr_off = 14; C.iq_off = 8; C.ver = 1; C.msgtype = 0;
+    /* these two were left to static zero-init, so --fc's documented default
+       never applied and every ppm readout came out as 0.000 */
+    C.nprb = 0; C.fc_hz = 3750e6;
 }
 
 static int cfg_derive(void)
@@ -431,9 +434,16 @@ enum { CMP_OFF = 0, CMP_OVERLAY = 1, CMP_DIFF = 2 };
 static int  g_cmp_mode = CMP_OFF;
 static bool g_save_ref = false;
 
-/* Zoom: look at a slot range instead of the whole frame */
-static bool  g_zoom    = false;
-static float g_zoom_lo = 0.0f, g_zoom_hi = 2.0f;
+/* Zoom: look at a slot range instead of the whole frame.
+   SliderFloat2 writes v[0] AND v[1] through the pointer it is given. Two
+   separate float objects are not an array, however adjacent they look in the
+   source - the compiler may order or pad them as it likes, so v[1] landed on
+   whatever the linker put next. One real array, and the two names kept as
+   macros so no call site below has to change. */
+static bool  g_zoom        = false;
+static float g_zoom_rng[2] = { 0.0f, 2.0f };
+#define g_zoom_lo  g_zoom_rng[0]
+#define g_zoom_hi  g_zoom_rng[1]
 
 static double g_cx[MAX_LANES][2];
 static double g_cy[MAX_LANES][2];
@@ -569,7 +579,9 @@ static std::vector<float> g_an_grid;       /* nsym * nprb, dBFS   */
 static std::vector<float> g_an_cpmag;      /* nsym, 0..1          */
 static std::vector<float> g_an_cpHz;       /* nsym, Hz            */
 static float g_an_Hz = 0.0f, g_an_ppm = 0.0f, g_an_conf = 0.0f;
-static float g_an_lo_db = -90.0f, g_an_hi_db = -20.0f;
+static float g_an_db[2] = { -90.0f, -20.0f };   /* one array - see g_zoom_rng */
+#define g_an_lo_db g_an_db[0]
+#define g_an_hi_db g_an_db[1]
 static int   g_an_have = 0, g_an_shown_slot = 0;
 static char  g_an_src[48] = "";
 
@@ -1458,7 +1470,7 @@ int main(int argc, char **argv)
                 ImGui::Checkbox("Zoom", &g_zoom);
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(300);
-                ImGui::SliderFloat2("slots", &g_zoom_lo, 0.0f, (float)C.slots,
+                ImGui::SliderFloat2("slots", g_zoom_rng, 0.0f, (float)C.slots,
                                     "%.2f");
                 if (g_zoom_hi <= g_zoom_lo) g_zoom_hi = g_zoom_lo + 0.25f;
                 ImGui::SameLine();
@@ -1552,7 +1564,7 @@ int main(int argc, char **argv)
                                 "the numerology or sample alignment is wrong");
                     }
                     ImGui::SetNextItemWidth(260);
-                    ImGui::SliderFloat2("dB range", &g_an_lo_db,
+                    ImGui::SliderFloat2("dB range", g_an_db,
                                         -140.0f, 0.0f, "%.0f");
                     if (g_an_hi_db <= g_an_lo_db) g_an_hi_db = g_an_lo_db + 1.0f;
                 }
