@@ -872,13 +872,6 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
 
     L->pkts.fetch_add(1, std::memory_order_relaxed);
 
-    /* sequence audit: a duplicate is a cell written twice in one frame, an
-       out-of-order is a backward step too small to be a frame wrap */
-    if (L->seen[cell]) L->n_dup.fetch_add(1, std::memory_order_relaxed);
-    if (L->started && cell < L->last_cell &&
-        L->last_cell - cell <= (uint32_t)(C.cells / 2))
-        L->n_ooo.fetch_add(1, std::memory_order_relaxed);
-
     /* arrival time against the time seq_id implies - the tool measured
        position and never time, which is the blind spot VALIDATION.md names */
     if (cell == 0) {
@@ -898,6 +891,18 @@ static void on_packet(unsigned char *user, const struct pcap_pkthdr *h,
        reordering and must not cut the frame in two */
     if (L->started && cell < L->last_cell &&
         L->last_cell - cell > (uint32_t)(C.cells / 2)) finish_frame(L);
+
+    /* Sequence audit, and it has to sit HERE, after the wrap. Run above it,
+       the test for seen[cell] met the PREVIOUS frame's array - finish_frame
+       had not cleared it yet - so the first packet of every frame counted as
+       a duplicate: 100 per second per lane, on a perfectly clean link, which
+       made the counter useless for telling a clean link from a dirty one.
+       Both tests also have to stay above the assignment to last_cell. */
+    if (L->seen[cell]) L->n_dup.fetch_add(1, std::memory_order_relaxed);
+    if (L->started && cell < L->last_cell &&
+        L->last_cell - cell <= (uint32_t)(C.cells / 2))
+        L->n_ooo.fetch_add(1, std::memory_order_relaxed);
+
     L->started   = 1;
     L->last_cell = cell;
 
