@@ -182,8 +182,8 @@ Compare        Save reference - Overlay / Difference
 Analyse        lane - Follow the signal - slot - Analyse - dB range
                + resource-grid heatmap
 Timing         per-lane jitter, out-of-order, duplicates
-Stop when      cells below N - energy in slot - a sender goes silent -
-               capture loses packets
+Stop when      cells below N - energy in slot (+ level %) -
+               a sender goes silent - capture loses packets
 ```
 
 **RUN/STOP** discards packets at the top of the capture callback while
@@ -204,6 +204,19 @@ alignment describes a position the trace no longer occupies.
 
 **Stop when** arms a condition and freezes the screen at the moment it fires,
 showing why. With nothing ticked it stops on the next frame — a scope's SINGLE.
+
+Two things about it that are easy to get wrong. **Armed is a separate switch**:
+ticking a condition says *what* to stop on, `Armed` is what makes any of them
+evaluate — look for the yellow `ARMED` on the right. And **pressing RUN clears
+Armed**, so the order is RUN first, tick Armed last.
+
+**energy in slot** judges the slot against the frame's own peak burst, at a
+settable percentage, never below 1% of full scale. An absolute threshold is
+useless here: no slot on a live link is ever truly empty — thermal noise,
+quantisation and DC leakage all sit well above the least significant bits — so
+a low fixed floor fires on the first frame every time regardless of content.
+The tab shows the measured span and the threshold side by side, so you can see
+what it is comparing before you arm it.
 
 ---
 
