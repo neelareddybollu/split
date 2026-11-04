@@ -479,6 +479,11 @@ enum { CMP_OFF = 0, CMP_OVERLAY = 1, CMP_DIFF = 2 };
 static int  g_cmp_mode = CMP_OFF;
 static bool g_save_ref = false;
 
+/* the control strip can be folded away entirely, so a trace being read
+   rather than adjusted gets the whole window */
+static bool g_show_ctl = true;
+static int  g_tab_want = -1;       /* a number key asking for a tab */
+
 /* Zoom: look at a slot range instead of the whole frame.
    SliderFloat2 writes v[0] AND v[1] through the pointer it is given. Two
    separate float objects are not an array, however adjacent they look in the
@@ -1346,17 +1351,26 @@ static void cursor_readout(lane_t *L, int idx)
 
 /* ================================================================ controls */
 
-/* A control row: a fixed-width label, then the widget. Every tab's controls
-   then start on the same left edge instead of wherever the previous widget
-   happened to finish, which is what made the old layout hard to scan. */
-#define CTL_LABEL_W   210.0f
-#define CTL_W         260.0f
+/* Each tab is ONE row. What the old layout lacked was not space, it was
+   labels and grouping - so controls keep their place on a single line, each
+   carries its name, each slider carries its units in its own format string,
+   and clusters are divided by a dim bar. Vertical dividers cost no height. */
 
-static void ctl_row(const char *label)
+/* a label immediately to the left of the widget that follows it */
+static void ctl_lbl(const char *label)
 {
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted(label);
-    ImGui::SameLine(CTL_LABEL_W);
+    ImGui::SameLine();
+}
+
+/* a dim divider between clusters, on the same row */
+static void ctl_div(void)
+{
+    ImGui::SameLine();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextColored(ImVec4(0.40f, 0.42f, 0.46f, 1.0f), "|");
+    ImGui::SameLine();
 }
 
 /* plain-language explanation on hover, for anything whose name cannot carry
@@ -1493,23 +1507,19 @@ int main(int argc, char **argv)
     ImGui::StyleColorsDark();
     ImGui::GetIO().FontGlobalScale = 1.15f;
 
-    /* The defaults are tuned for dense tool palettes on a small window. This
-       runs full screen on a lab monitor, often read from a step back, so
-       everything gets more room: controls that are not touching each other
-       are easier to hit and much easier to tell apart. */
+    /* A little more room than the defaults, and no more. The plots are the
+       instrument; the controls are a strip above them, and every row spent
+       on the strip is a row taken off the trace. */
     {
         ImGuiStyle &st = ImGui::GetStyle();
-        st.WindowPadding     = ImVec2(14, 12);
-        st.FramePadding      = ImVec2(10,  6);
-        st.ItemSpacing       = ImVec2(16, 10);
-        st.ItemInnerSpacing  = ImVec2(10,  6);
-        st.FrameRounding     = 4.0f;
-        st.GrabRounding      = 4.0f;
-        st.GrabMinSize       = 14.0f;
-        st.TabRounding       = 4.0f;
-        st.ScrollbarSize     = 16.0f;
-        st.SeparatorTextBorderSize = 2.0f;
-        st.SeparatorTextPadding    = ImVec2(24, 6);
+        st.WindowPadding     = ImVec2(10,  8);
+        st.FramePadding      = ImVec2( 7,  4);
+        st.ItemSpacing       = ImVec2(10,  6);
+        st.ItemInnerSpacing  = ImVec2( 6,  4);
+        st.FrameRounding     = 3.0f;
+        st.GrabRounding      = 3.0f;
+        st.GrabMinSize       = 11.0f;
+        st.TabRounding       = 3.0f;
     }
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
@@ -1551,6 +1561,40 @@ int main(int argc, char **argv)
         const uint64_t now   = now_us();
         const uint32_t drop  = g_drop.load(), ifdrop = g_ifdrop.load();
         const uint64_t blank_us = (uint64_t)(g_blank_secs * 1e6);
+
+        /* Keyboard. On a real scope you do not hunt for Run with a mouse, and
+           a shortcut costs no screen space at all. */
+        if (!ImGui::GetIO().WantTextInput) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+                const bool was = g_acquire.load();
+                g_acquire.store(!was);
+                g_armed.store(false);
+                if (was) g_stop_us.store(now);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+                { std::lock_guard<std::mutex> g(g_trg_mtx); g_trg_reason[0] = 0; }
+                g_trg_cells.store(false);  g_trg_slot.store(false);
+                g_trg_silent.store(false); g_trg_drop.store(false);
+                g_armed.store(true);
+                g_acquire.store(true);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_C, false))
+                for (int i = 0; i < lanes; i++) g_lane[i].reset.store(true);
+            if (ImGui::IsKeyPressed(ImGuiKey_A, false) && C.ofdm_ok) {
+                g_an_ready.store(false);
+                g_an_tries.store(0);
+                g_an_arm.store(true);
+                const int al = g_an_lane.load();
+                snprintf(g_an_src, sizeof g_an_src, "%s",
+                         (al < lanes) ? g_lane[al].title : "?");
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_H, false)) g_show_ctl = !g_show_ctl;
+            for (int t = 0; t < 6; t++)
+                if (ImGui::IsKeyPressed((ImGuiKey)(ImGuiKey_1 + t), false)) {
+                    g_tab_want  = t;
+                    g_show_ctl  = true;
+                }
+        }
 
         bool stale[MAX_LANES] = { false }, blank[MAX_LANES] = { false };
         uint64_t total_pps = 0;
@@ -1670,144 +1714,149 @@ int main(int argc, char **argv)
         if (g_cursors)
             for (int i = 0; i < lanes; i++) cursor_readout(&g_lane[i], i);
 
+        /* ------------------------------------------------------- controls
+           One row per tab. Vertical dividers group the clusters without
+           costing any height, every slider carries its own units, and the
+           whole strip folds away with H when the trace is what matters. */
         ImGui::Separator();
 
-        /* Tabs, not columns. Positioning the second group at a percentage of
-           the window width meant it collided with the first whenever the
-           first grew - tabs cannot overlap, and only the controls you are
-           using are on screen. */
-        if (ImGui::BeginTabBar("##tabs")) {
+        {
+            ImGui::AlignTextToFramePadding();
+            if (ImGui::SmallButton(g_show_ctl ? "hide controls  (H)"
+                                              : "show controls  (H)"))
+                g_show_ctl = !g_show_ctl;
+            ImGui::SameLine();
+            ctl_note("space RUN/STOP   s single   c clear   a analyse   "
+                     "1-6 tabs");
+        }
 
-            if (ImGui::BeginTabItem("View")) {
-                ImGui::SeparatorText("Trace");
+        if (g_show_ctl && ImGui::BeginTabBar("##tabs")) {
 
-                ctl_row("Afterglow");
-                ImGui::SetNextItemWidth(CTL_W);
-                ImGui::Combo("##ag", &g_ag_mode,
-                             "Off - live frame only\0"
-                             "Fade - decays over time\0"
-                             "Hold - never decays\0");
+            ImGuiTabItemFlags tf[6];
+            for (int t = 0; t < 6; t++)
+                tf[t] = (g_tab_want == t) ? ImGuiTabItemFlags_SetSelected : 0;
+
+            if (ImGui::BeginTabItem("View", NULL, tf[0])) {
+                ctl_lbl("Afterglow");
+                ImGui::SetNextItemWidth(190);
+                ImGui::Combo("##ag", &g_ag_mode, "Off\0Fade\0Hold\0");
                 ctl_hint("Off shows only the frame arriving now. Fade and Hold "
-                         "keep older frames on screen - useful for seeing a "
+                         "keep older frames on screen - useful for watching a "
                          "burst move, misleading if you forget it is on, "
                          "because what you see may already be gone.");
                 g_persist = (g_ag_mode != AG_OFF);
                 if (g_ag_mode == AG_FADE) {
                     ImGui::SameLine();
-                    ImGui::SetNextItemWidth(220);
+                    ImGui::SetNextItemWidth(150);
                     ImGui::SliderFloat("##fade", &g_afterglow, 0.2f, 20.0f,
                                        "decay %.1f s");
                 } else if (g_ag_mode == AG_HOLD) {
                     g_afterglow = 0.0f;       /* never decays */
                 }
 
-                ctl_row("Vertical scale");
-                ImGui::Checkbox("Fit to signal", &g_autofit);
-                ctl_hint("On: the amplitude axis follows the signal, rising at "
-                         "once and falling slowly. Off: fixed full scale, "
-                         "-1.0 to +1.0, so two runs can be compared by eye.");
-                ImGui::SameLine();
-                if (ImGui::Button("Clear trace", ImVec2(150, 0)))
+                ctl_div();
+                if (ImGui::Button("Clear trace"))
                     for (int i = 0; i < lanes; i++) g_lane[i].reset.store(true);
-                ctl_hint("Throws away the accumulated afterglow and starts it "
-                         "again from the next frame.");
+                ctl_hint("Throws the accumulated afterglow away and starts it "
+                         "again from the next frame.  (c)");
 
-                ImGui::SeparatorText("Zoom");
+                ctl_div();
+                ImGui::Checkbox("Fit scale", &g_autofit);
+                ctl_hint("On: the amplitude axis follows the signal, rising at "
+                         "once and falling slowly. Off: fixed full scale, -1.0 "
+                         "to +1.0, so two runs can be compared by eye.");
 
-                ctl_row("Zoom to a slot range");
-                ImGui::Checkbox("##zoom", &g_zoom);
+                ctl_div();
+                ImGui::Checkbox("Zoom", &g_zoom);
                 ImGui::SameLine();
                 ImGui::BeginDisabled(!g_zoom);
-                ImGui::SetNextItemWidth(360);
+                ImGui::SetNextItemWidth(230);
                 ImGui::SliderFloat2("##zr", g_zoom_rng, 0.0f, (float)C.slots,
                                     "slot %.2f");
                 ImGui::EndDisabled();
                 if (g_zoom_hi <= g_zoom_lo) g_zoom_hi = g_zoom_lo + 0.25f;
 
-                ctl_row("Hide a silent lane after");
-                ImGui::SetNextItemWidth(CTL_W);
-                ImGui::SliderFloat("##blank", &g_blank_secs, 1.0f, 30.0f,
-                                   "%.0f s");
-                ctl_hint("A lane with no signal for this long is blanked, so a "
-                         "dead sender looks dead instead of frozen.");
+                ctl_div();
+                if (ImGui::Button("More...")) ImGui::OpenPopup("viewmore");
+                if (ImGui::BeginPopup("viewmore")) {
+                    ctl_lbl("Hide a silent lane after");
+                    ImGui::SetNextItemWidth(190);
+                    ImGui::SliderFloat("##blank", &g_blank_secs, 1.0f, 30.0f,
+                                       "%.0f s");
+                    ctl_note("a lane with no signal for this long is blanked,\n"
+                             "so a dead sender looks dead and not frozen");
+                    ImGui::EndPopup();
+                }
                 ImGui::EndTabItem();
             }
 
-            if (ImGui::BeginTabItem("Measure")) {
-                ImGui::SeparatorText("Readouts");
-
-                ctl_row("Cursors");
-                ImGui::Checkbox("##cur", &g_cursors);
+            if (ImGui::BeginTabItem("Measure", NULL, tf[1])) {
+                ImGui::Checkbox("Cursors", &g_cursors);
                 ctl_hint("Two vertical and two horizontal markers per lane, "
                          "draggable. The readout above gives the gap in slots, "
-                         "microseconds, samples and packets, and in raw counts "
-                         "vertically.");
+                         "microseconds, samples and packets, and vertically in "
+                         "raw counts.");
 
-                ctl_row("DC offset");
+                ctl_div();
                 bool dc = g_measure_dc.load();
-                if (ImGui::Checkbox("##dc", &dc)) g_measure_dc.store(dc);
+                if (ImGui::Checkbox("DC offset", &dc)) g_measure_dc.store(dc);
                 ctl_hint("Averages I and Q over the whole frame and shows the "
                          "mean in raw counts. A non-zero mean is carrier "
                          "leakage. Costs a little capture-side work, so it is "
                          "off by default.");
 
-                ImGui::SeparatorText("Alignment");
-
-                ctl_row("Lock to signal");
+                ctl_div();
                 bool al = g_align.load();
-                if (ImGui::Checkbox("##align", &al)) g_align.store(al);
-                ctl_hint("Rotates the trace so a drifting burst is held still "
-                         "on screen. The burst's real position is then NOT what "
-                         "the x axis says - turn this off before reading any "
-                         "slot number off the display.");
+                if (ImGui::Checkbox("Lock to signal", &al)) g_align.store(al);
+                ctl_hint("Rotates the trace so a drifting burst is held still. "
+                         "The burst's real position is then NOT what the x axis "
+                         "says - turn this off before reading a slot number off "
+                         "the display.");
                 ImGui::SameLine();
                 /* re-locking clears persistence too - see finish_frame */
-                if (ImGui::Button("Re-lock", ImVec2(150, 0)))
+                if (ImGui::Button("Re-lock"))
                     for (int i = 0; i < lanes; i++) g_lane[i].reacquire.store(true);
-                ctl_hint("Throws away the stored reference and locks onto the "
-                         "signal again. Also clears the afterglow, which was "
-                         "accumulated at the old alignment.");
+                ctl_hint("Throws away the stored reference and locks on again. "
+                         "Also clears the afterglow, which was accumulated at "
+                         "the old alignment.");
                 ImGui::EndTabItem();
             }
 
-            if (ImGui::BeginTabItem("Compare")) {
-                ImGui::SeparatorText("Reference frame");
-
+            if (ImGui::BeginTabItem("Compare", NULL, tf[2])) {
                 int nref = 0;
                 for (int i = 0; i < lanes; i++) nref += g_lane[i].has_ref;
 
-                ctl_row("Capture");
-                g_save_ref = ImGui::Button("Save reference", ImVec2(190, 0));
+                g_save_ref = ImGui::Button("Save reference");
                 ctl_hint("Stores the frame on screen for every lane, to hold "
                          "later frames against.");
-                ImGui::SameLine();
+
+                ctl_div();
+                ctl_lbl("Show as");
+                ImGui::BeginDisabled(nref == 0);
+                ImGui::SetNextItemWidth(210);
+                ImGui::Combo("##cmp", &g_cmp_mode,
+                             "Off\0Overlay\0Difference\0");
+                ImGui::EndDisabled();
+                ctl_hint("Overlay draws the stored frame over the live one. "
+                         "Difference subtracts it, so anything unchanged "
+                         "flattens to zero and only what moved is left.");
+
+                ctl_div();
                 if (nref)
                     ImGui::TextColored(ImVec4(0.6f, 0.75f, 1, 1),
                                        "stored for %d lane%s",
                                        nref, nref == 1 ? "" : "s");
                 else
                     ctl_note("nothing stored yet");
-
-                ctl_row("Show as");
-                ImGui::BeginDisabled(nref == 0);
-                ImGui::SetNextItemWidth(CTL_W);
-                ImGui::Combo("##cmp", &g_cmp_mode,
-                             "Off\0Overlay - both at once\0"
-                             "Difference - live minus stored\0");
-                ImGui::EndDisabled();
-                ctl_hint("Overlay draws the stored frame over the live one. "
-                         "Difference subtracts it, so anything unchanged "
-                         "flattens to zero and only what moved is left.");
                 ImGui::EndTabItem();
             }
 
-            if (ImGui::BeginTabItem("Analyse")) {
+            if (ImGui::BeginTabItem("Analyse", NULL, tf[3])) {
                 if (C.mu != 1) {
                     ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
                         "OFDM analysis is only validated for mu=1 - this link "
-                        "is mu=%d. The long cyclic prefix sits at a different "
-                        "symbol there, and placing it wrongly would smear the "
-                        "grid without saying so.", C.mu);
+                        "is mu=%d, where the long cyclic prefix sits elsewhere.",
+                        C.mu);
                 } else if (!C.ofdm_ok) {
                     ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
                         "OFDM geometry does not close for %.2f Msps at mu=%d",
@@ -1816,34 +1865,29 @@ int main(int argc, char **argv)
                     int  al = g_an_lane.load(), as = g_an_slot.load();
                     bool au = g_an_auto.load();
 
-                    ImGui::SeparatorText("What to analyse");
-
-                    ctl_row("Transmitter");
-                    ImGui::SetNextItemWidth(CTL_W);
+                    ctl_lbl("Lane");
+                    ImGui::SetNextItemWidth(130);
                     if (ImGui::SliderInt("##anlane", &al, 0,
-                                         lanes > 0 ? lanes - 1 : 0, "lane %d"))
+                                         lanes > 0 ? lanes - 1 : 0, "%d"))
                         g_an_lane.store(al);
-                    ImGui::SameLine();
-                    ctl_note("%s", (al < lanes) ? g_lane[al].title : "-");
 
-                    ctl_row("Slot");
+                    ctl_div();
                     if (ImGui::Checkbox("Follow the signal", &au))
                         g_an_auto.store(au);
                     ctl_hint("Aims at whichever slot holds the strongest burst "
-                             "in this lane, re-reading it every frame. A "
-                             "drifting burst is then tracked instead of chased. "
+                             "in this lane, re-reading it every frame, so a "
+                             "drifting burst is tracked instead of chased. "
                              "Untick to pin one slot.");
                     ImGui::SameLine();
                     ImGui::BeginDisabled(au);
-                    ImGui::SetNextItemWidth(220);
+                    ImGui::SetNextItemWidth(150);
                     if (ImGui::SliderInt("##anslot", &as, 0, C.slots - 1,
                                          "slot %d"))
                         g_an_slot.store(as);
                     ImGui::EndDisabled();
 
-                    ImGui::Spacing();
-                    ctl_row("");
-                    if (ImGui::Button("Analyse", ImVec2(190, 40))) {
+                    ctl_div();
+                    if (ImGui::Button("Analyse")) {
                         g_an_ready.store(false);
                         g_an_tries.store(0);
                         g_an_arm.store(true);
@@ -1854,63 +1898,55 @@ int main(int argc, char **argv)
                              "the analysis once. Only a frame whose chosen slot "
                              "actually contains signal is used, so empty frames "
                              "are skipped rather than measured. Works while "
-                             "acquisition is stopped.");
-                    ImGui::SameLine();
+                             "acquisition is stopped.  (a)");
+
+                    ctl_div();
+                    ImGui::AlignTextToFramePadding();
                     if (g_an_arm.load()) {
                         const int tr = g_an_tries.load();
-                        ImGui::AlignTextToFramePadding();
                         if (tr)
                             ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1),
-                                "waiting on slot %d - %d empty frame%s skipped",
-                                g_an_slot.load(), tr, tr == 1 ? "" : "s");
+                                "waiting on slot %d, %d empty skipped",
+                                g_an_slot.load(), tr);
                         else
                             ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1),
-                                "waiting for a frame with signal in slot %d",
+                                "waiting for signal in slot %d",
                                 g_an_slot.load());
                     } else if (g_an_have) {
-                        ImGui::AlignTextToFramePadding();
                         ImGui::TextColored(ImVec4(0.6f, 0.75f, 1, 1),
-                                           "showing %s, slot %d", g_an_src,
-                                           g_an_shown_slot);
-                    }
-
-                    if (g_an_have) {
-                        ImGui::SeparatorText("Result");
-                        ctl_row("Carrier offset");
-                        ImGui::Text("%+.1f Hz   (%+.3f ppm at %.0f MHz)",
-                                    g_an_Hz, g_an_ppm, C.fc_hz / 1e6);
-                        ctl_hint("Measured from the cyclic prefix, so it does "
-                                 "not depend on seq_id at all. Unambiguous only "
-                                 "to half a subcarrier - a true +20 kHz reads "
-                                 "as -10 kHz.");
-                        ctl_row("CP match");
-                        ImGui::Text("%.2f", g_an_conf);
-                        ctl_hint("How well each symbol's prefix matches its own "
-                                 "tail. Near 1.0 confirms the sample rate, the "
-                                 "FFT size and the numerology all at once.");
+                            "slot %d:  %+.1f Hz  (%+.3f ppm)   CP match %.2f",
+                            g_an_shown_slot, g_an_Hz, g_an_ppm, g_an_conf);
+                        ctl_hint("Carrier offset measured from the cyclic "
+                                 "prefix, so it does not depend on seq_id at "
+                                 "all - but it is unambiguous only to half a "
+                                 "subcarrier, so a true +20 kHz reads as -10. "
+                                 "CP match near 1.0 confirms the sample rate, "
+                                 "the FFT size and the numerology at once.");
                         if (g_an_conf < 0.3f) {
-                            ctl_row("");
+                            ImGui::SameLine();
                             ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
-                                "weak match - the slot held signal, so suspect "
-                                "the numerology or the sample alignment");
+                                "- weak: suspect numerology or alignment");
                         }
+                    } else {
+                        ctl_note("no analysis yet");
                     }
 
-                    ImGui::SeparatorText("Grid display");
-                    ctl_row("Colour range");
-                    ImGui::SetNextItemWidth(360);
-                    ImGui::SliderFloat2("##db", g_an_db, -140.0f, 0.0f,
-                                        "%.0f dB");
-                    if (g_an_hi_db <= g_an_lo_db) g_an_hi_db = g_an_lo_db + 1.0f;
+                    ctl_div();
+                    if (ImGui::Button("More...")) ImGui::OpenPopup("anmore");
+                    if (ImGui::BeginPopup("anmore")) {
+                        ctl_lbl("Grid colour range");
+                        ImGui::SetNextItemWidth(230);
+                        ImGui::SliderFloat2("##db", g_an_db, -140.0f, 0.0f,
+                                            "%.0f dB");
+                        if (g_an_hi_db <= g_an_lo_db)
+                            g_an_hi_db = g_an_lo_db + 1.0f;
+                        ImGui::EndPopup();
+                    }
                 }
                 ImGui::EndTabItem();
             }
 
-            if (ImGui::BeginTabItem("Timing")) {
-                ImGui::SeparatorText("Arrival against the time seq_id implies");
-                ctl_note("counts are cumulative totals since start, never "
-                         "reset - sample twice and subtract to get a rate");
-                ImGui::Spacing();
+            if (ImGui::BeginTabItem("Timing", NULL, tf[4])) {
                 for (int i = 0; i < lanes; i++) {
                     lane_t *L = &g_lane[i];
                     ImGui::TextColored(COL[i % MAX_LANES],
@@ -1920,15 +1956,14 @@ int main(int argc, char **argv)
                         (unsigned long long)L->n_ooo.load(),
                         (unsigned long long)L->n_dup.load());
                 }
+                ctl_note("arrival against the time seq_id implies. Counts are "
+                         "totals since start and are never reset - sample "
+                         "twice and subtract to get a rate.");
                 ImGui::EndTabItem();
             }
 
-            if (ImGui::BeginTabItem("Stop when")) {
+            if (ImGui::BeginTabItem("Stop when", NULL, tf[5])) {
                 const bool armed = g_armed.load();
-
-                ImGui::SeparatorText("Arming");
-
-                ctl_row("");
                 {
                     const ImVec4 on (0.72f, 0.55f, 0.10f, 1.0f);
                     const ImVec4 onh(0.86f, 0.66f, 0.16f, 1.0f);
@@ -1937,9 +1972,7 @@ int main(int argc, char **argv)
                     ImGui::PushStyleColor(ImGuiCol_Button,        armed ? on  : off);
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, armed ? onh : ofh);
                     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  armed ? onh : ofh);
-                    if (ImGui::Button(armed ? "ARMED - waiting"
-                                            : "Not armed - click to arm",
-                                      ImVec2(300, 40))) {
+                    if (ImGui::Button(armed ? "ARMED" : "arm", ImVec2(110, 0))) {
                         g_armed.store(!armed);
                         if (!armed) {
                             std::lock_guard<std::mutex> g(g_trg_mtx);
@@ -1948,73 +1981,73 @@ int main(int argc, char **argv)
                     }
                     ImGui::PopStyleColor(3);
                 }
-                ctl_hint("The conditions below say WHAT to stop on. This is "
-                         "what makes any of them count. Note that pressing RUN "
-                         "disarms, so arm last.");
-                ImGui::SameLine();
-                ImGui::AlignTextToFramePadding();
-                if (!g_acquire.load())
+                ctl_hint("The conditions say WHAT to stop on; this is what "
+                         "makes any of them count. Pressing RUN disarms, so "
+                         "arm last. With nothing ticked it stops on the next "
+                         "frame - a single shot.");
+                if (!g_acquire.load()) {
+                    ImGui::SameLine();
+                    ImGui::AlignTextToFramePadding();
                     ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
-                        "acquisition is stopped - press RUN first, then arm");
-                else
-                    ctl_note("with nothing ticked below it stops on the next "
-                             "frame (single shot)");
+                                       "press RUN first");
+                }
 
-                ImGui::SeparatorText("Conditions");
-
+                ctl_div();
                 bool tc = g_trg_cells.load();
-                ctl_row("A frame is incomplete");
-                if (ImGui::Checkbox("##tc", &tc)) g_trg_cells.store(tc);
+                if (ImGui::Checkbox("incomplete frame", &tc)) g_trg_cells.store(tc);
                 ctl_hint("Fires when a lane assembles fewer cells than this. "
-                         "Set it to one below the full count to catch the first "
-                         "frame that loses anything - this is the condition for "
-                         "catching mirror saturation.");
+                         "Set it one below the full count to catch the first "
+                         "frame that loses anything - this is the condition "
+                         "for catching mirror saturation.");
                 ImGui::SameLine();
                 ImGui::BeginDisabled(!tc);
                 int cn = g_trg_cells_n.load();
-                ImGui::SetNextItemWidth(260);
-                if (ImGui::SliderInt("##cn", &cn, 1, C.cells, "below %d cells"))
+                ImGui::SetNextItemWidth(170);
+                if (ImGui::SliderInt("##cn", &cn, 1, C.cells, "under %d"))
                     g_trg_cells_n.store(cn);
                 ImGui::EndDisabled();
 
+                ctl_div();
                 bool ts = g_trg_slot.load();
-                ctl_row("A burst lands in a slot");
-                if (ImGui::Checkbox("##ts", &ts)) g_trg_slot.store(ts);
+                if (ImGui::Checkbox("burst in slot", &ts)) g_trg_slot.store(ts);
                 ctl_hint("Fires when the chosen slot carries a burst reaching "
-                         "the level below, measured against that frame's own "
-                         "biggest burst. A fixed absolute level is useless "
-                         "here: no slot on a live link is ever truly silent.");
+                         "the level set here, measured against that frame's "
+                         "own biggest burst. An absolute level is useless: no "
+                         "slot on a live link is ever truly silent.");
                 ImGui::SameLine();
                 ImGui::BeginDisabled(!ts);
                 int sn = g_trg_slot_n.load();
-                ImGui::SetNextItemWidth(180);
+                ImGui::SetNextItemWidth(130);
                 if (ImGui::SliderInt("##sn", &sn, 0, C.slots - 1, "slot %d"))
                     g_trg_slot_n.store(sn);
                 ImGui::SameLine();
                 int lv = g_trg_slot_pc.load();
-                ImGui::SetNextItemWidth(220);
-                if (ImGui::SliderInt("##lv", &lv, 1, 100,
-                                     "at %d%% of frame peak"))
+                ImGui::SetNextItemWidth(130);
+                if (ImGui::SliderInt("##lv", &lv, 1, 100, "at %d%%"))
                     g_trg_slot_pc.store(lv);
                 ImGui::EndDisabled();
                 if (ts) {
-                    ctl_row("");
+                    ImGui::SameLine();
                     const float sv = g_trg_slot_seen.load();
                     const float th = g_trg_slot_thr.load();
+                    ImGui::AlignTextToFramePadding();
                     ImGui::TextColored(sv > th ? ImVec4(0.3f, 1, 0.3f, 1)
                                                : ImVec4(0.62f, 0.62f, 0.62f, 1),
-                        "that slot is carrying %.4f, needs %.4f", sv, th);
+                                       "%.4f / %.4f", sv, th);
+                    ctl_hint("what that slot is carrying, against what it "
+                             "needs to fire");
                 }
 
+                ctl_div();
                 bool tq = g_trg_silent.load();
-                ctl_row("A sender goes silent");
-                if (ImGui::Checkbox("##tq", &tq)) g_trg_silent.store(tq);
+                if (ImGui::Checkbox("sender silent", &tq)) g_trg_silent.store(tq);
                 ctl_hint("Fires when any lane stops producing frames for more "
                          "than half a second.");
 
+                ctl_div();
                 bool td = g_trg_drop.load();
-                ctl_row("The capture loses packets");
-                if (ImGui::Checkbox("##td", &td)) g_trg_drop.store(td);
+                if (ImGui::Checkbox("capture loses packets", &td))
+                    g_trg_drop.store(td);
                 ctl_hint("Fires on the first non-zero drop or ifdrop - libpcap "
                          "falling behind, which is a different fault from loss "
                          "inside the switch.");
@@ -2022,6 +2055,7 @@ int main(int argc, char **argv)
             }
             ImGui::EndTabBar();
         }
+        g_tab_want = -1;
 
         ImGui::Separator();
 
