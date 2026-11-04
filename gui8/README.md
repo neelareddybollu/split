@@ -175,16 +175,29 @@ Analyse refuses elsewhere. Everything else stays numerology-agnostic.
 RUN / STOP     red while running, green while stopped, top right on its own
 Single         resume, then stop on the next frame
 
-View           Afterglow (Off / Fade / Hold) - Clear trace - Auto scale
-               Zoom (slot range) - Hide silent after
-Measure        Cursors - DC offset - Lock to signal - Re-lock
-Compare        Save reference - Overlay / Difference
-Analyse        lane - Follow the signal - slot - Analyse - dB range
-               + resource-grid heatmap
-Timing         per-lane jitter, out-of-order, duplicates
-Stop when      cells below N - energy in slot (+ level %) -
-               a sender goes silent - capture loses packets
+View      Trace    Afterglow (Off / Fade / Hold) + decay
+                   Vertical scale: fit to signal - Clear trace
+          Zoom     Zoom to a slot range - Hide a silent lane after
+
+Measure   Readouts   Cursors - DC offset
+          Alignment  Lock to signal - Re-lock
+
+Compare   Reference frame   Save reference - Show as Overlay / Difference
+
+Analyse   What to analyse   Transmitter - Slot (Follow the signal) - Analyse
+          Result            Carrier offset - CP match
+          Grid display      Colour range          + resource-grid heatmap
+
+Timing    per-lane jitter, out-of-order, duplicates
+
+Stop when Arming      one button: armed / not armed
+          Conditions  a frame is incomplete - a burst lands in a slot
+                      a sender goes silent - the capture loses packets
 ```
+
+Controls are laid out one per row with the label on a fixed left edge, and
+every control carries a plain-language explanation on hover. Anything that
+depends on another setting greys out until that setting is on.
 
 **RUN/STOP** discards packets at the top of the capture callback while
 `pcap_loop` keeps draining the socket, so the kernel ring never overflows and
