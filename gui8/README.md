@@ -175,29 +175,32 @@ Analyse refuses elsewhere. Everything else stays numerology-agnostic.
 RUN / STOP     red while running, green while stopped, top right on its own
 Single         resume, then stop on the next frame
 
-View      Trace    Afterglow (Off / Fade / Hold) + decay
-                   Vertical scale: fit to signal - Clear trace
-          Zoom     Zoom to a slot range - Hide a silent lane after
-
-Measure   Readouts   Cursors - DC offset
-          Alignment  Lock to signal - Re-lock
-
-Compare   Reference frame   Save reference - Show as Overlay / Difference
-
-Analyse   What to analyse   Transmitter - Slot (Follow the signal) - Analyse
-          Result            Carrier offset - CP match
-          Grid display      Colour range          + resource-grid heatmap
-
-Timing    per-lane jitter, out-of-order, duplicates
-
-Stop when Arming      one button: armed / not armed
-          Conditions  a frame is incomplete - a burst lands in a slot
-                      a sender goes silent - the capture loses packets
+View       Afterglow + decay | Clear trace | Fit scale | Zoom + range | More...
+Measure    Cursors | DC offset | Lock to signal + Re-lock
+Compare    Save reference | Show as | what is stored
+Analyse    Lane | Follow the signal + slot | Analyse | result | More...
+Timing     per-lane jitter, out-of-order, duplicates
+Stop when  arm | incomplete frame | burst in slot + level | sender silent |
+           capture loses packets
 ```
 
-Controls are laid out one per row with the label on a fixed left edge, and
-every control carries a plain-language explanation on hover. Anything that
-depends on another setting greys out until that setting is on.
+Each tab is **one row**. Clusters are divided by a dim `|`, every slider
+carries its units in its own display format, and every control has a
+plain-language explanation on hover. Anything that depends on another setting
+greys out until that setting is on. Settings you touch once a session — the
+blanking time, the grid colour range — live behind **More...** rather than
+taking permanent space.
+
+### Keyboard
+
+```
+space   RUN / STOP          c   clear trace
+s       single shot         a   analyse
+h       hide/show controls  1-6 select tab
+```
+
+**`h` folds the whole control strip away** and gives the plots the full
+window, which is what you want once the setting-up is done.
 
 **RUN/STOP** discards packets at the top of the capture callback while
 `pcap_loop` keeps draining the socket, so the kernel ring never overflows and
