@@ -438,6 +438,13 @@ static std::atomic<bool>  g_trg_cells(false);
 static std::atomic<int>   g_trg_cells_n(640);
 static std::atomic<bool>  g_trg_slot(false);
 static std::atomic<int>   g_trg_slot_n(8);
+/* the level that counts as "energy", as a percentage of the frame's own peak
+   burst, plus the last measured span and threshold so the tab can show you
+   what it is actually comparing */
+static std::atomic<int>   g_trg_slot_pc(25);
+static std::atomic<float> g_trg_slot_seen(0.0f);
+static std::atomic<float> g_trg_slot_thr(0.0f);
+#define TRG_SLOT_MIN      0.01f      /* never below 1% of full scale */
 static std::atomic<bool>  g_trg_silent(false);
 static std::atomic<bool>  g_trg_drop(false);
 static std::mutex         g_trg_mtx;
@@ -902,9 +909,24 @@ static void finish_frame(lane_t *L)
                 float mx = 0.0f;
                 for (int c = c0; c < c1; c++)
                     if (L->span[c] > mx) mx = L->span[c];
-                if (mx > burst_floor * 4.0f) {
+
+                /* Judged against THIS frame's biggest burst, not against an
+                   absolute floor. The floor used to be four LSBs, about
+                   -52 dBFS, which no slot on a live link is ever below -
+                   thermal noise, quantisation and DC leakage all sit above
+                   it - so the condition fired on the first frame every time,
+                   whatever was in the slot. A measured 0.0024 against a
+                   0.2915 burst is noise, and should not be a trigger. */
+                float thr = 0.01f * (float)g_trg_slot_pc.load() * peak_span;
+                if (thr < TRG_SLOT_MIN) thr = TRG_SLOT_MIN;
+
+                g_trg_slot_seen.store(mx, std::memory_order_relaxed);
+                g_trg_slot_thr.store(thr, std::memory_order_relaxed);
+
+                if (mx > thr) {
                     snprintf(why, sizeof why,
-                             "%s  energy in slot %d (%.4f)", L->title, sl, mx);
+                             "%s  energy in slot %d (%.4f, over %.4f)",
+                             L->title, sl, mx, thr);
                     fired = why;
                 }
             }
@@ -1272,7 +1294,12 @@ static void lane_status(lane_t *L, ImVec4 col, uint64_t now, bool blank)
                            L->title, age / 1e6);
         return;
     }
-    if (age > STALE_US) {
+    /* ...and the same has to be true here. The caller gates the stale[] array
+       on acquisition, but this function ran its own ungated test, so a few
+       seconds after STOP every lane turned orange and claimed to be stale -
+       on a frozen screen, where "last frame, not live" is the whole point of
+       what you are looking at. */
+    if (age > STALE_US && g_acquire.load()) {
         ImGui::TextColored(ImVec4(1, 0.55f, 0.25f, 1),
                            "  %-26s STALE %.1f s  -- last frame, not live",
                            L->title, age / 1e6);
@@ -1779,6 +1806,15 @@ int main(int argc, char **argv)
                 ImGui::SetNextItemWidth(130);
                 if (ImGui::SliderInt("##sn", &sn, 0, C.slots - 1))
                     g_trg_slot_n.store(sn);
+                ImGui::SameLine();
+                int lv = g_trg_slot_pc.load();
+                ImGui::SetNextItemWidth(150);
+                if (ImGui::SliderInt("##lv", &lv, 1, 100, "level %d%%"))
+                    g_trg_slot_pc.store(lv);
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1),
+                    "of the frame's own peak   now %.4f vs %.4f",
+                    g_trg_slot_seen.load(), g_trg_slot_thr.load());
 
                 bool tq = g_trg_silent.load();
                 if (ImGui::Checkbox("a sender goes silent", &tq))
