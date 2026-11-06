@@ -497,7 +497,31 @@ static float g_zoom_rng[2] = { 0.0f, 2.0f };
 
 static double g_cx[MAX_LANES][2];
 static double g_cy[MAX_LANES][2];
-static double g_span_hold[MAX_LANES];
+static double   g_span_hold[MAX_LANES];
+static uint64_t g_span_low_us[MAX_LANES];
+
+/* A scope does not scale continuously - it picks a range off a 1-2-5 ladder
+   and stays there. Continuous fitting is what made the trace shake: the peak
+   sample wanders by a fraction of a percent frame to frame, and the axis was
+   following every wobble a hundred times a second.
+
+   So: snap to the ladder, step up at once when the signal needs the room,
+   and step down only after it has stayed small for a while. Between those
+   the axis does not move at all. */
+static const double SPAN_LADDER[] = {
+    1e-4, 2e-4, 5e-4, 1e-3, 2e-3, 5e-3, 1e-2, 2e-2, 5e-2,
+    0.1,  0.2,  0.5,  1.0
+};
+#define SPAN_STEPS  ((int)(sizeof SPAN_LADDER / sizeof SPAN_LADDER[0]))
+#define SPAN_FILL   0.90      /* the peak may fill this much of the range */
+#define SPAN_DOWN_US 1500000ULL   /* quiet for this long before stepping down */
+
+static double span_range_for(double peak)
+{
+    for (int i = 0; i < SPAN_STEPS; i++)
+        if (SPAN_LADDER[i] >= peak / SPAN_FILL) return SPAN_LADDER[i];
+    return 1.0;
+}
 
 static void lane_title(lane_t *L, int idx)
 {
@@ -535,7 +559,7 @@ static void lane_alloc(lane_t *L, int idx)
     L->jit_lo.store(0.0); L->jit_hi.store(0.0);
     g_cx[idx][0] = 4.0;  g_cx[idx][1] = 8.0;
     g_cy[idx][0] = -0.1; g_cy[idx][1] = 0.1;
-    g_span_hold[idx] = 1e-4;
+    g_span_hold[idx] = 1e-4; g_span_low_us[idx] = 0;
 }
 
 /* capture thread only */
@@ -1182,7 +1206,7 @@ static void draw_lane(lane_t *L, int idx, ImVec4 col, bool show_x,
         std::fill(g_plo.begin(), g_plo.end(), 0.0);
         std::fill(g_phi.begin(), g_phi.end(), 0.0);
         std::fill(g_mid.begin(), g_mid.end(), 0.0);
-        g_span_hold[idx] = 1e-4;
+        g_span_hold[idx] = 1e-4; g_span_low_us[idx] = 0;
     } else {
         std::lock_guard<std::mutex> lk(L->mtx);
         for (int c = 0; c < N; c++) {
@@ -1205,20 +1229,31 @@ static void draw_lane(lane_t *L, int idx, ImVec4 col, bool show_x,
 
     if (stale) { col.x *= 0.35f; col.y *= 0.35f; col.z *= 0.35f; }
 
-    double target = 1e-6;
+    double peak = 0.0;
     for (int c = 0; c < N; c++) {
-        if (fabs(g_hi[c]) > target) target = fabs(g_hi[c]);
-        if (fabs(g_lo[c]) > target) target = fabs(g_lo[c]);
+        if (fabs(g_hi[c]) > peak) peak = fabs(g_hi[c]);
+        if (fabs(g_lo[c]) > peak) peak = fabs(g_lo[c]);
         if (g_persist) {
-            if (fabs(g_phi[c]) > target) target = fabs(g_phi[c]);
-            if (fabs(g_plo[c]) > target) target = fabs(g_plo[c]);
+            if (fabs(g_phi[c]) > peak) peak = fabs(g_phi[c]);
+            if (fabs(g_plo[c]) > peak) peak = fabs(g_plo[c]);
         }
     }
-    if (target < 1e-4) target = 1e-4;
-    target *= 1.15;
 
     double *S = &g_span_hold[idx];
-    *S = (target > *S) ? target : *S + (target - *S) * 0.05;
+    const double want = span_range_for(peak);
+    if (want > *S) {                       /* needs room now */
+        *S = want;
+        g_span_low_us[idx] = 0;
+    } else if (want < *S) {                /* smaller, but wait and see */
+        const uint64_t t = now_us();
+        if (!g_span_low_us[idx]) g_span_low_us[idx] = t;
+        else if (t - g_span_low_us[idx] > SPAN_DOWN_US) {
+            *S = want;
+            g_span_low_us[idx] = 0;
+        }
+    } else {
+        g_span_low_us[idx] = 0;
+    }
     const double span = *S;
 
     ImPlotAxisFlags xf = ImPlotAxisFlags_Lock;
