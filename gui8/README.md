@@ -207,6 +207,14 @@ window, which is what you want once the setting-up is done.
 RUN resumes on live data rather than a backlog. Staleness and blanking are
 suppressed while stopped — a frozen screen stays on screen.
 
+**Fit scale** picks a range off a 1-2-5 ladder, the way a scope picks
+volts/div, rather than following the signal continuously. It steps up the
+moment the signal needs the room and steps down only after the signal has
+stayed small for a second and a half. Continuous fitting looks like the
+obvious thing to do and is wrong: the peak sample wanders by a fraction of a
+percent frame to frame, so the axis chases it a hundred times a second and the
+whole trace shakes. Between steps this axis does not move at all.
+
 **Afterglow** is a phosphor model, not a high-water mark. *Fade* decays towards
 the live trace with a settable time constant; *Hold* never decays; *Off* shows
 only the live frame. Worth remembering when reading the screen: **in Fade or
